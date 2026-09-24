@@ -59,6 +59,11 @@ class GRPORollout:
     mean_reward: float
     std_reward: float
     acceptance_rate: float
+    mean_entropy: float = 0.0
+    dead_group: bool = False
+    hint_rescued: bool = False
+    spontaneous_correct: bool = False
+    truncation_rate: float = 0.0
 
 
 class DiffuGRPOTrainer:
@@ -326,6 +331,23 @@ class DiffuGRPOTrainer:
         std_r = float(rewards.std(unbiased=False).item())
         mean_alpha = float(sum(acceptance_rates) / max(len(acceptance_rates), 1))
 
+        entropies = [
+            e for traj in trajectories for e in traj.entropies if e is not None
+        ]
+        mean_entropy = float(sum(entropies) / max(len(entropies), 1))
+        dead_group = std_r < 1e-8
+        hint_rescued = bool(prompt_item.metadata.get("curriculum_hint_applied"))
+        spontaneous_correct = (
+            not hint_rescued
+            and bool((rewards >= self.min_correct_threshold).any().item())
+        )
+        truncated = [
+            len(traj.completion_tokens) >= self.config.max_new_tokens
+            and not any(tok in eos_ids for tok in traj.completion_tokens)
+            for traj in trajectories
+        ]
+        truncation_rate = float(sum(truncated) / max(len(truncated), 1))
+
         return GRPORollout(
             prompt_item=prompt_item,
             completions=completions,
@@ -335,6 +357,11 @@ class DiffuGRPOTrainer:
             mean_reward=mean_r,
             std_reward=std_r,
             acceptance_rate=mean_alpha,
+            mean_entropy=mean_entropy,
+            dead_group=dead_group,
+            hint_rescued=hint_rescued,
+            spontaneous_correct=spontaneous_correct,
+            truncation_rate=truncation_rate,
         )
 
     def compute_rollout_loss(self, rollout: GRPORollout) -> Tuple[torch.Tensor, GRPOMetrics]:
@@ -440,8 +467,13 @@ class DiffuGRPOTrainer:
         loss, metrics = self.compute_rollout_loss(rollout)
         loss.backward()
 
+        grad_norm = 0.0
         if self.config.max_grad_norm > 0:
-            torch.nn.utils.clip_grad_norm_(self.trainable_params, self.config.max_grad_norm)
+            grad_norm = float(
+                torch.nn.utils.clip_grad_norm_(
+                    self.trainable_params, self.config.max_grad_norm
+                ).item()
+            )
 
         self.optimizer.step()
 
@@ -453,8 +485,15 @@ class DiffuGRPOTrainer:
             "policy_loss": metrics.policy_loss,
             "kl_loss": metrics.kl_loss,
             "mean_reward": rollout.mean_reward,
+            "reward_std": rollout.std_reward,
+            "mean_entropy": rollout.mean_entropy,
             "acceptance_rate": rollout.acceptance_rate,
             "clip_fraction": metrics.clip_fraction,
+            "dead_group": float(rollout.dead_group),
+            "hint_rescued": float(rollout.hint_rescued),
+            "spontaneous_correct": float(rollout.spontaneous_correct),
+            "truncation_rate": rollout.truncation_rate,
+            "grad_norm": grad_norm,
         }
 
     def step(self, batch: List[PromptItem], global_step: Optional[int] = None) -> Dict[str, float]:
@@ -469,8 +508,14 @@ class DiffuGRPOTrainer:
         total_policy_loss = 0.0
         total_kl_loss = 0.0
         total_reward = 0.0
+        total_reward_std = 0.0
+        total_entropy = 0.0
         total_alpha = 0.0
         total_clip = 0.0
+        total_dead = 0.0
+        total_rescued = 0.0
+        total_spontaneous = 0.0
+        total_truncation = 0.0
         B = len(batch)
         cur_step = global_step if global_step is not None else self.global_step
 
@@ -485,11 +530,22 @@ class DiffuGRPOTrainer:
             total_policy_loss += metrics.policy_loss / B
             total_kl_loss += metrics.kl_loss / B
             total_reward += rollout.mean_reward / B
+            total_reward_std += rollout.std_reward / B
+            total_entropy += rollout.mean_entropy / B
             total_alpha += rollout.acceptance_rate / B
             total_clip += metrics.clip_fraction / B
+            total_dead += float(rollout.dead_group) / B
+            total_rescued += float(rollout.hint_rescued) / B
+            total_spontaneous += float(rollout.spontaneous_correct) / B
+            total_truncation += rollout.truncation_rate / B
 
+        grad_norm = 0.0
         if self.config.max_grad_norm > 0:
-            torch.nn.utils.clip_grad_norm_(self.trainable_params, self.config.max_grad_norm)
+            grad_norm = float(
+                torch.nn.utils.clip_grad_norm_(
+                    self.trainable_params, self.config.max_grad_norm
+                ).item()
+            )
 
         self.optimizer.step()
         self.global_step += 1
@@ -503,8 +559,15 @@ class DiffuGRPOTrainer:
             "policy_loss": total_policy_loss,
             "kl_loss": total_kl_loss,
             "mean_reward": total_reward,
+            "reward_std": total_reward_std,
+            "mean_entropy": total_entropy,
             "acceptance_rate": total_alpha,
             "clip_fraction": total_clip,
+            "dead_group": total_dead,
+            "hint_rescued": total_rescued,
+            "spontaneous_correct": total_spontaneous,
+            "truncation_rate": total_truncation,
+            "grad_norm": grad_norm,
         }
 
     def train(

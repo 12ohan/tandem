@@ -361,9 +361,15 @@ def train(args: argparse.Namespace) -> None:
             print(
                 f"Step {current_step:03d}/{total_steps:03d} | "
                 f"Loss: {metrics['loss']:.4f} (pol: {metrics['policy_loss']:.4f}, kl: {metrics['kl_loss']:.4f}) | "
-                f"Reward: {metrics['mean_reward']:.2f} | "
+                f"Reward: {metrics['mean_reward']:.2f} σ={metrics['reward_std']:.2f} | "
                 f"Alpha: {metrics['acceptance_rate']:.1%} | "
                 f"Clip: {metrics['clip_fraction']:.1%} | "
+                f"Dead: {metrics['dead_group']:.0f} | "
+                f"Rescue: {metrics['hint_rescued']:.0f} | "
+                f"Spont: {metrics['spontaneous_correct']:.0f} | "
+                f"Trunc: {metrics['truncation_rate']:.1%} | "
+                f"Entropy: {metrics['mean_entropy']:.2f} | "
+                f"Grad: {metrics['grad_norm']:.2f} | "
                 f"Driver: {mem['driver_gb']:.2f} GB | "
                 f"Time: {dt:.1f}s"
             )
