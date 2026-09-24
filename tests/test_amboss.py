@@ -882,3 +882,21 @@ def test_amboss_modifier_aware_partial_matching_controls():
 
     comp_chlor = "<think>Hypertension regimen.</think><answer>Chlorthalidone</answer>"
     assert reward_fn.compute_reward(prompt="case", completion=comp_chlor, ground_truth="Lisinopril and chlorthalidone") == 0.0
+
+
+def test_amboss_abbreviation_ambiguity_and_cased_short_tokens():
+    """Verify S. pneumoniae expansion is specific, and the short-token allowlist is case-cased."""
+    from tandem.rl.amboss import _extract_keywords
+
+    reward_fn = AmbossDifferentialReward()
+
+    comp_pneumo = "<think>Gram-positive diplococci.</think><answer>S. pneumoniae</answer>"
+    assert reward_fn.compute_reward(prompt="case", completion=comp_pneumo, ground_truth="Streptococcus pneumoniae") == 2.0
+
+    # S. aureus is Staphylococcus, not Streptococcus; it must not be expanded as strep.
+    comp_aureus = "<think>Gram-positive cocci in clusters.</think><answer>S. aureus</answer>"
+    assert reward_fn.compute_reward(prompt="case", completion=comp_aureus, ground_truth="Streptococcus pneumoniae") == 0.0
+
+    # Cased allowlist: pH is preserved, lowercase ph is not a short-token bypass.
+    assert "ph" in _extract_keywords("pH", min_len=4)
+    assert "ph" not in _extract_keywords("ph", min_len=4)

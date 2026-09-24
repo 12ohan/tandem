@@ -37,7 +37,7 @@ DIAGNOSIS_STOP_WORDS: Set[str] = {
 
 # Short clinical tokens to preserve during keyword extraction (raw-case checked)
 SHORT_CLINICAL_ALLOWLIST: Set[str] = {
-    "PH", "PO2", "PCO2", "BP", "O2", "HB",
+    "pH", "Hb", "O2", "BP", "pO2", "pCO2",
 }
 
 # Clinical modifiers that may be dropped or added without changing the underlying diagnosis
@@ -102,7 +102,7 @@ def _diagnosis_tokens(text: str) -> Set[str]:
     # Possessive normalization: Cushing's -> cushing, Cushing’s -> cushing
     s = re.sub(r"['’]s\b", "", s)
     # Minimal abbreviation expansion for the current positive-control contract.
-    s = re.sub(r"\bs\.\s*", "streptococcus ", s)
+    s = re.sub(r"\bs\.\s*(pneumoniae|pyogenes)\b", r"streptococcus \1", s)
     s = re.sub(r"\bstrep\.?\s*", "streptococcus ", s)
     tokens = set(re.findall(r"[a-zA-Z0-9]+", s)) - DIAGNOSIS_STOP_WORDS
     return tokens
@@ -119,7 +119,7 @@ def _extract_keywords(
     kept: Set[str] = set()
     for raw in raw_words:
         lowered = raw.lower()
-        allowed = len(raw) >= min_len or raw.upper() in SHORT_CLINICAL_ALLOWLIST
+        allowed = len(raw) >= min_len or raw in SHORT_CLINICAL_ALLOWLIST
         if allowed and lowered not in exclude:
             kept.add(lowered)
     return kept
@@ -628,7 +628,7 @@ class AmbossDifferentialReward(BaseReward):
                     str(k).strip().lower()
                     for k in rationale
                     if len(str(k).strip()) >= self.min_keyword_length
-                    or str(k).strip().upper() in SHORT_CLINICAL_ALLOWLIST
+                    or str(k).strip() in SHORT_CLINICAL_ALLOWLIST
                 }
             else:
                 kws = _extract_keywords(
