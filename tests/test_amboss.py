@@ -74,8 +74,8 @@ def test_amboss_question_dataclass():
         {
             "content": "Prostate cancer",
             "letter": "a",
-            "rationale": "Klinefelter syndrome patients have decreased incidence of prostate cancer.",
-            "explanationWhy": "Klinefelter syndrome patients have decreased incidence of prostate cancer.",
+            "rationale": "Klinefelter syndrome patients have lower incidence of prostate cancer.",
+            "explanationWhy": "Klinefelter syndrome patients have lower incidence of prostate cancer.",
             "explanationBut": "",
         },
         {
@@ -162,7 +162,7 @@ def test_amboss_differential_reward_gold_only():
     gt = "Breast cancer"
     candidates = ["Prostate cancer", "Aortic dissection"]
     buts = {
-        "Prostate cancer": "decreased incidence of prostate cancer in Klinefelter syndrome",
+        "Prostate cancer": "lower incidence of prostate cancer in Klinefelter syndrome",
         "Aortic dissection": "Marfan syndrome connective tissue disorder",
     }
 
@@ -183,12 +183,12 @@ def test_amboss_differential_reward_gold_plus_one_ruleout():
     gt = "Breast cancer"
     candidates = ["Prostate cancer", "Aortic dissection"]
     buts = {
-        "Prostate cancer": "decreased incidence of prostate cancer in Klinefelter syndrome",
+        "Prostate cancer": "lower incidence of prostate cancer in Klinefelter syndrome",
         "Aortic dissection": "Marfan syndrome connective tissue disorder",
     }
 
     completion = (
-        "<think>Prostate cancer ruled out because incidence is decreased in Klinefelter syndrome.</think>"
+        "<think>Prostate cancer ruled out because incidence is lower in Klinefelter syndrome.</think>"
         "<answer>Breast cancer</answer>"
     )
     score = reward_fn.compute_reward(
@@ -207,13 +207,13 @@ def test_amboss_differential_reward_gold_plus_two_ruleouts():
     gt = "Breast cancer"
     candidates = ["Prostate cancer", "Aortic dissection"]
     buts = {
-        "Prostate cancer": "decreased incidence of prostate cancer in Klinefelter syndrome",
+        "Prostate cancer": "lower incidence of prostate cancer in Klinefelter syndrome",
         "Aortic dissection": "Marfan syndrome connective tissue disorder",
     }
 
     completion = (
         "<think>"
-        "1. Prostate cancer: ruled out because incidence is decreased.\n"
+        "1. Prostate cancer: ruled out because incidence is lower.\n"
         "2. Aortic dissection: characteristic of Marfan syndrome with connective tissue disorder, "
         "not seen in this patient.\n"
         "</think>"
@@ -237,13 +237,13 @@ def test_amboss_differential_reward_matching_ruleouts_failing_gold():
     gt = "Breast cancer"
     candidates = ["Prostate cancer", "Aortic dissection"]
     buts = {
-        "Prostate cancer": "decreased incidence of prostate cancer in Klinefelter syndrome",
+        "Prostate cancer": "lower incidence of prostate cancer in Klinefelter syndrome",
         "Aortic dissection": "Marfan syndrome connective tissue disorder",
     }
 
     # 1 rule-out matched, gold failed
     comp_ro1 = (
-        "<think>Prostate cancer is ruled out because incidence is decreased in this syndrome.</think>"
+        "<think>Prostate cancer is ruled out because incidence is lower in this syndrome.</think>"
         "<answer>Aortic dissection</answer>"
     )
     score_ro1 = reward_fn.compute_reward(
@@ -259,7 +259,7 @@ def test_amboss_differential_reward_matching_ruleouts_failing_gold():
     # 2 rule-outs matched, gold failed
     comp_ro2 = (
         "<think>"
-        "Prostate cancer ruled out due to decreased incidence. "
+        "Prostate cancer ruled out due to lower incidence. "
         "Aortic dissection ruled out because connective tissue disorder of Marfan syndrome is absent."
         "</think>"
         "<answer>Leukemia</answer>"
@@ -288,7 +288,7 @@ def test_amboss_differential_reward_failing_both():
     gt = "Breast cancer"
     candidates = ["Prostate cancer", "Aortic dissection"]
     buts = {
-        "Prostate cancer": "decreased incidence of prostate cancer in Klinefelter syndrome",
+        "Prostate cancer": "lower incidence of prostate cancer in Klinefelter syndrome",
         "Aortic dissection": "Marfan syndrome connective tissue disorder",
     }
 
@@ -316,10 +316,10 @@ def test_amboss_differential_reward_max_score_cap():
 
     completion = (
         "<think>"
-        "Option A ruled out with alpha beta. "
-        "Option C ruled out with epsilon zeta. "
-        "Option D ruled out with iota kappa. "
-        "Option E ruled out with omega sigma. "
+        "Option A ruled out without alpha beta. "
+        "Option C ruled out unlike epsilon zeta. "
+        "Option D ruled out lacks iota kappa. "
+        "Option E ruled out, but omega sigma is absent. "
         "</think>"
         "<answer>Breast cancer</answer>"
     )
@@ -496,12 +496,12 @@ def test_amboss_proximity_attribution():
     reward_fn = AmbossDifferentialReward(gate_on_gold=False)
     gt = "Breast cancer"
     candidates = ["Prostate cancer"]
-    buts = {"Prostate cancer": "decreased incidence"}
+    buts = {"Prostate cancer": "lower incidence"}
 
     # Distractor name mentioned at start, keyword dumped at end >50 words away
     filler = " " + "word " * 60
     comp_stuffed = (
-        f"<think>Prostate cancer was considered.{filler}However decreased incidence occurs elsewhere.</think>"
+        f"<think>Prostate cancer was considered.{filler}However lower incidence occurs elsewhere.</think>"
         "<answer>Breast cancer</answer>"
     )
     score_stuffed = reward_fn.compute_reward(
@@ -597,17 +597,21 @@ def test_amboss_adversarial_keyword_stuffing_without_candidate():
 
 
 def test_amboss_adversarial_asymmetric_substring_gold_rejection():
-    """Verify that answering with a generic subword ('Acute') does NOT match multi-word gold ('Acute cholecystitis')."""
+    """Verify that answering with a generic subword ('Acute') does NOT match multi-word gold ('Acute cholecystitis'),
+    while legitimate substantial clinical partials ('Cholecystitis') pass under the length-ratio guard (>= 0.50).
+    """
     reward_fn = AmbossDifferentialReward()
     gt = "Acute cholecystitis"
 
+    # Generic modifier ("Acute"): len 5 / 19 = 0.263 < 0.50 -> rejected
     comp_generic = "<think>High suspicion of acute condition.</think><answer>Acute</answer>"
     score_generic = reward_fn.compute_reward(prompt="case", completion=comp_generic, ground_truth=gt)
     assert score_generic == 0.0  # Must NOT match gold
 
-    comp_inverted = "<think>High suspicion.</think><answer>Cholecystitis</answer>"
-    score_inverted = reward_fn.compute_reward(prompt="case", completion=comp_inverted, ground_truth=gt)
-    assert score_inverted == 0.0  # Partial single-word does NOT match compound gold
+    # Legitimate clinical partial ("Cholecystitis"): len 13 / 19 = 0.684 >= 0.50 -> accepted
+    comp_partial = "<think>High suspicion.</think><answer>Cholecystitis</answer>"
+    score_partial = reward_fn.compute_reward(prompt="case", completion=comp_partial, ground_truth=gt)
+    assert score_partial == 2.0  # Legitimate clinical partial matches gold
 
 
 def test_amboss_adversarial_rule_out_without_gold_magnitude_dominance():
@@ -666,3 +670,196 @@ def test_amboss_adversarial_rule_out_without_gold_magnitude_dominance():
     assert (score_correct - score_wrong) >= 1.20  # Minimum 1.20 gap guarantees no score inversion
 
 
+def test_amboss_adversarial_affirmative_rationale_exploit_and_morphological_trap():
+    """Verify that parroting affirmative rationale without contrast/negation earns zero credit,
+    and morphological trap ('painless' containing substring 'pain') does not trigger false match.
+    """
+    reward_fn = AmbossDifferentialReward(gate_on_gold=False)
+    gt = "Treponema pallidum"  # Syphilis: painless chancre
+    candidates = ["Haemophilus ducreyi"]  # Chancroid: painful ulcers
+    buts = {"Haemophilus ducreyi": "painful ulcers, fluctuant buboes"}
+
+    # 1. Exploit: model parrots affirmative features with colon after candidate name without establishing patient lacks them
+    comp_exploit = (
+        "<think>Haemophilus ducreyi ruled out: painful ulcers, fluctuant buboes.</think>"
+        "<answer>Treponema pallidum</answer>"
+    )
+    score_exploit = reward_fn.compute_reward(
+        prompt="case", completion=comp_exploit, ground_truth=gt,
+        differential_candidates=candidates, distractor_buts=buts,
+    )
+    assert score_exploit == 2.0  # Only gold awarded; rule-out rejected due to missing contrast/negation
+
+    # 2. Morphological trap: 'painless' contains substring 'pain'.
+    # Word boundary matching ensures 'pain' does not match 'painless', and no false credit is given.
+    comp_morph_trap = (
+        "<think>Haemophilus ducreyi considered, but patient has a painless lesion.</think>"
+        "<answer>Treponema pallidum</answer>"
+    )
+    score_morph = reward_fn.compute_reward(
+        prompt="case", completion=comp_morph_trap, ground_truth=gt,
+        differential_candidates=candidates, distractor_buts=buts,
+    )
+    # Rationale has 'painful', completion has 'painless' -> regex \b rejects subword match
+    assert score_morph == 2.0
+
+    # 3. Legitimate clinical contrast: model explicitly contrasts chancroid's painful features or notes absence
+    comp_legit = (
+        "<think>Haemophilus ducreyi is unlikely because unlike chancroid which presents with painful ulcers, "
+        "this patient has no buboes and the ulcer is painless.</think>"
+        "<answer>Treponema pallidum</answer>"
+    )
+    score_legit = reward_fn.compute_reward(
+        prompt="case", completion=comp_legit, ground_truth=gt,
+        differential_candidates=candidates, distractor_buts=buts,
+    )
+    # Gold (2.0) + 1 verified ruleout (0.20) = 2.20
+    assert score_legit == pytest.approx(2.20, abs=1e-5)
+
+
+def test_amboss_adversarial_clinical_subword_false_positives():
+    """Verify that clinical subwords do NOT match different clinical entities:
+    - 'Carditis' must NOT match 'Myocarditis' or 'Pericarditis'
+    - 'Cystitis' must NOT match 'Cholecystitis'
+    - 'Pain' must NOT match 'Painless'
+    """
+    reward_fn = AmbossDifferentialReward()
+
+    # 1. Carditis vs Myocarditis / Pericarditis
+    comp_carditis = "<think>Exam suggests cardiac issue.</think><answer>Carditis</answer>"
+    assert reward_fn.compute_reward(prompt="case", completion=comp_carditis, ground_truth="Myocarditis") == 0.0
+    assert reward_fn.compute_reward(prompt="case", completion=comp_carditis, ground_truth="Pericarditis") == 0.0
+
+    # 2. Cystitis (bladder) vs Cholecystitis (gallbladder)
+    comp_cystitis = "<think>Abdominal inflammation.</think><answer>Cystitis</answer>"
+    assert reward_fn.compute_reward(prompt="case", completion=comp_cystitis, ground_truth="Cholecystitis") == 0.0
+    assert reward_fn.compute_reward(prompt="case", completion=comp_cystitis, ground_truth="Acute cholecystitis") == 0.0
+
+    # 3. Pain vs Painless (forward match with word boundaries)
+    comp_painless = "<think>Genital examination.</think><answer>Painless</answer>"
+    assert reward_fn.compute_reward(prompt="case", completion=comp_painless, ground_truth="Pain") == 0.0
+
+
+def test_amboss_adversarial_distractor_rationale_containing_contrast_words_parrot_exploit():
+    """Verify that when the AMBOSS distractor rationale itself contains contrast words like 'unlike' or 'no',
+    a model that merely parrots the distractor's affirmative pathology receives zero rule-out credit.
+    """
+    reward_fn = AmbossDifferentialReward(gate_on_gold=False)
+    gt = "Treponema pallidum"
+    candidates = ["Haemophilus ducreyi"]
+    # AMBOSS rationale contains "unlike" and "no", but the distractor's pathology is "painful ulcers"
+    buts = {
+        "Haemophilus ducreyi": "unlike syphilis which causes no pain, chancroid presents with painful ulcers and fluctuant buboes"
+    }
+
+    # Model parrots the distractor's affirmative pathology without establishing patient-specific contrast
+    comp_parrot = (
+        "<think>Haemophilus ducreyi ruled out: painful ulcers, fluctuant buboes.</think>"
+        "<answer>Treponema pallidum</answer>"
+    )
+    score = reward_fn.compute_reward(
+        prompt="case", completion=comp_parrot, ground_truth=gt,
+        differential_candidates=candidates, distractor_buts=buts,
+    )
+    # The AMBOSS rationale had 'unlike' and 'no', but the model's text lacks contrast -> zero rule-out credit
+    assert score == 2.0  # Gold awarded (2.0), rule-out credit rejected (0.0)
+
+
+def test_amboss_diagnosis_stop_words_and_clinical_head_nouns():
+    """Verify diagnosis stop-word preservation and clinical head noun distinctions:
+    - Cushing disease vs Cushing syndrome -> reject (score 0.0)
+    - Addison disease vs Addisonian crisis -> reject (score 0.0)
+    - nephrotic syndrome vs nephritic syndrome -> reject (score 0.0)
+    - Generic head nouns alone ('Syndrome', 'Disease') -> reject (score 0.0)
+    - Compound partials ('Cholecystitis' for 'Acute cholecystitis') -> accept (score 2.0)
+    """
+    reward_fn = AmbossDifferentialReward()
+
+    # 1. Cushing disease vs Cushing syndrome
+    comp_cushing_syn = "<think>Elevated ACTH and cortisol.</think><answer>Cushing syndrome</answer>"
+    assert reward_fn.compute_reward(prompt="case", completion=comp_cushing_syn, ground_truth="Cushing disease") == 0.0
+
+    comp_cushing_dis = "<think>Elevated ACTH and cortisol.</think><answer>Cushing disease</answer>"
+    assert reward_fn.compute_reward(prompt="case", completion=comp_cushing_dis, ground_truth="Cushing syndrome") == 0.0
+
+    # 2. Addison disease vs Addisonian crisis
+    comp_addison_crisis = "<think>Adrenal insufficiency presentation.</think><answer>Addisonian crisis</answer>"
+    assert reward_fn.compute_reward(prompt="case", completion=comp_addison_crisis, ground_truth="Addison disease") == 0.0
+
+    comp_addison_dis = "<think>Adrenal insufficiency presentation.</think><answer>Addison disease</answer>"
+    assert reward_fn.compute_reward(prompt="case", completion=comp_addison_dis, ground_truth="Addisonian crisis") == 0.0
+
+    # 3. Nephrotic syndrome vs Nephritic syndrome
+    comp_nephritic = "<think>Renal findings with hematuria.</think><answer>Nephritic syndrome</answer>"
+    assert reward_fn.compute_reward(prompt="case", completion=comp_nephritic, ground_truth="Nephrotic syndrome") == 0.0
+
+    comp_nephrotic = "<think>Heavy proteinuria and edema.</think><answer>Nephrotic syndrome</answer>"
+    assert reward_fn.compute_reward(prompt="case", completion=comp_nephrotic, ground_truth="Nephritic syndrome") == 0.0
+
+    # 4. Generic head nouns alone must NOT match specific diagnoses
+    comp_syndrome = "<think>Complex clinical findings.</think><answer>Syndrome</answer>"
+    assert reward_fn.compute_reward(prompt="case", completion=comp_syndrome, ground_truth="Cushing syndrome") == 0.0
+
+    comp_disease = "<think>Infectious disease etiology.</think><answer>Disease</answer>"
+    assert reward_fn.compute_reward(prompt="case", completion=comp_disease, ground_truth="Graves disease") == 0.0
+
+    # 5. Legitimate compound partials must still match
+    comp_cholecystitis = "<think>RUQ pain and Murphy sign.</think><answer>Cholecystitis</answer>"
+    assert reward_fn.compute_reward(prompt="case", completion=comp_cholecystitis, ground_truth="Acute cholecystitis") == 2.0
+
+    comp_appendicitis = "<think>RLQ pain and McBurney tenderness.</think><answer>Appendicitis</answer>"
+    assert reward_fn.compute_reward(prompt="case", completion=comp_appendicitis, ground_truth="Acute appendicitis") == 2.0
+
+
+def test_amboss_short_clinical_tokens_allowlist():
+    """Verify that short 2-character clinical tokens (pH, pO2, BP, etc.) are preserved
+    and can trigger rule-out credit when valid contrast is established.
+    """
+    from tandem.rl.amboss import _extract_keywords, SHORT_CLINICAL_ALLOWLIST
+
+    # Test keyword extraction preserves short tokens
+    text = "Arterial blood gas shows abnormal pH and low pO2 with elevated BP"
+    kws = _extract_keywords(text, min_len=4)
+    for token in ["ph", "po2", "bp"]:
+        assert token in kws, f"Expected short token '{token}' in extracted keywords"
+
+    # Test ruleout credit using short clinical token
+    reward_fn = AmbossDifferentialReward(gate_on_gold=False)
+    gt = "Metabolic acidosis"
+    candidates = ["Respiratory acidosis"]
+    buts = {
+        "Respiratory acidosis": "unlike metabolic acidosis which shows low pH with low bicarbonate, respiratory acidosis shows high pCO2"
+    }
+
+    comp = (
+        "<think>Respiratory acidosis is ruled out because patient lacks elevated pco2.</think>"
+        "<answer>Metabolic acidosis</answer>"
+    )
+    score = reward_fn.compute_reward(
+        prompt="case",
+        completion=comp,
+        ground_truth=gt,
+        differential_candidates=candidates,
+        distractor_buts=buts,
+    )
+    # Gold (2.0) + ruleout credit for respiratory acidosis (0.20) = 2.20
+    assert abs(score - 2.20) < 1e-4
+
+
+def test_amboss_diagnosis_abbreviation_and_possessive_controls():
+    """Verify abbreviation expansion and possessive normalization in gold matching."""
+    reward_fn = AmbossDifferentialReward()
+
+    comp_s = "<think>Gram-positive diplococci.</think><answer>S. pneumoniae</answer>"
+    assert reward_fn.compute_reward(prompt="case", completion=comp_s, ground_truth="Streptococcus pneumoniae") == 2.0
+
+    comp_poss = "<think>Elevated ACTH and cortisol.</think><answer>Cushing's syndrome</answer>"
+    assert reward_fn.compute_reward(prompt="case", completion=comp_poss, ground_truth="Cushing syndrome") == 2.0
+
+
+@pytest.mark.xfail(strict=True, reason="pneumococcus synonym requires CUI/alias layer")
+def test_amboss_pneumococcus_synonym_known_gap():
+    """Known recall gap: pneumococcus is a true synonym of S. pneumoniae but not a token variant."""
+    reward_fn = AmbossDifferentialReward()
+    comp = "<think>Gram-positive diplococci.</think><answer>pneumococcus</answer>"
+    assert reward_fn.compute_reward(prompt="case", completion=comp, ground_truth="Streptococcus pneumoniae") == 2.0

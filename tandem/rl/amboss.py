@@ -30,6 +30,22 @@ STOP_WORDS: Set[str] = {
     "syndrome", "syndromes", "disease", "diseases", "disorder", "disorders", "condition", "conditions",
 }
 
+# Grammatical-only stop words for diagnosis matching (preserves clinical head nouns like syndrome, disease)
+DIAGNOSIS_STOP_WORDS: Set[str] = {
+    "a", "an", "the", "of", "in", "and", "or", "with", "due", "to", "by", "for", "on", "at", "from",
+}
+
+# Short clinical tokens to preserve during keyword extraction (raw-case checked)
+SHORT_CLINICAL_ALLOWLIST: Set[str] = {
+    "PH", "PO2", "PCO2", "BP", "O2", "HB",
+}
+
+# Generic clinical head nouns that cannot qualify as a diagnosis on their own
+GENERIC_CLINICAL_HEAD_NOUNS: Set[str] = {
+    "syndrome", "syndromes", "disease", "diseases", "disorder", "disorders",
+    "condition", "conditions", "infection", "infections", "carcinoma",
+}
+
 
 def clean_amboss_html(html_str: Optional[str]) -> str:
     """Robust regex-based cleaner for Amboss HTML content.
@@ -70,6 +86,18 @@ def _normalize_text(text: str) -> str:
     return s
 
 
+def _diagnosis_tokens(text: str) -> Set[str]:
+    """Tokenise a diagnosis, preserving clinical head nouns and expanding common abbreviations."""
+    s = text.lower()
+    # Possessive normalization: Cushing's -> cushing, Cushing’s -> cushing
+    s = re.sub(r"['’]s\b", "", s)
+    # Minimal abbreviation expansion for the current positive-control contract.
+    s = re.sub(r"\bs\.\s*", "streptococcus ", s)
+    s = re.sub(r"\bstrep\.?\s*", "streptococcus ", s)
+    tokens = set(re.findall(r"[a-zA-Z0-9]+", s)) - DIAGNOSIS_STOP_WORDS
+    return tokens
+
+
 def _extract_keywords(
     text: str,
     exclude_words: Optional[Set[str]] = None,
@@ -77,8 +105,14 @@ def _extract_keywords(
 ) -> Set[str]:
     """Extract informative non-stopword tokens from rationale text."""
     exclude = STOP_WORDS if exclude_words is None else STOP_WORDS | exclude_words
-    words = re.findall(r"[a-zA-Z0-9_\-]+", text.lower())
-    return {w for w in words if len(w) >= min_len and w not in exclude}
+    raw_words = re.findall(r"[a-zA-Z0-9_\-]+", text)
+    kept: Set[str] = set()
+    for raw in raw_words:
+        lowered = raw.lower()
+        allowed = len(raw) >= min_len or raw.upper() in SHORT_CLINICAL_ALLOWLIST
+        if allowed and lowered not in exclude:
+            kept.add(lowered)
+    return kept
 
 
 @dataclass
@@ -124,7 +158,9 @@ class AmbossQuestion:
             if d.get("content")
         }
 
-    def to_prompt_item(self, include_options: bool = True) -> PromptItem:
+    def to_prompt_item(
+        self, include_options: bool = True, format_primed: bool = False
+    ) -> PromptItem:
         """Convert this Amboss question into a training PromptItem."""
         prompt = self.vignette.strip()
         if include_options and self.options:
@@ -136,11 +172,26 @@ class AmbossQuestion:
             if opt_lines:
                 prompt += "\n\nOptions:\n" + "\n".join(opt_lines)
 
-        prompt += (
-            "\n\nPlease analyze this clinical case. In your thinking process (<think>...</think>), "
-            "evaluate the clinical presentation, develop a differential diagnosis, and rule out competing candidate conditions. "
-            "Provide the final diagnosis inside <answer>...</answer>."
-        )
+        if format_primed:
+            prompt += (
+                "\n\nPlease analyze this clinical case. Structure your response using <think>...</think> "
+                "for clinical reasoning and distractor rule-outs, followed by <answer>...</answer> for your final diagnosis.\n"
+                "Example format:\n"
+                "<think>\n"
+                "Evaluating presentation: patient presents with acute symptom complex.\n"
+                "Differential diagnosis includes Condition A and Condition B.\n"
+                "Condition A is ruled out because [pertinent negative finding is absent].\n"
+                "Condition B is the primary diagnosis supported by [pertinent positive finding].\n"
+                "</think>\n"
+                "<answer>Condition B</answer>\n\n"
+                "Now analyze the patient case above:"
+            )
+        else:
+            prompt += (
+                "\n\nPlease analyze this clinical case. In your thinking process (<think>...</think>), "
+                "evaluate the clinical presentation, develop a differential diagnosis, and rule out competing candidate conditions. "
+                "Provide the final diagnosis inside <answer>...</answer>."
+            )
 
         metadata = {
             "qid": self.qid,
@@ -213,6 +264,7 @@ def load_amboss_questions(
     split: Literal["all", "train", "eval"] = "all",
     eval_split_ratio: float = 0.15,
     eval_seed: int = 42,
+    format_primed: bool = False,
 ) -> List[PromptItem]:
     """Loads Amboss questions into PromptItem instances with deterministic train/eval splitting.
 
@@ -228,6 +280,7 @@ def load_amboss_questions(
         split: "all", "train" (85% default), or "eval" (15% held-out default).
         eval_split_ratio: Fraction of questions allocated to held-out eval (default 0.15 ~ 500 Qs).
         eval_seed: Seed for deterministic hash-based splitting on question ID.
+        format_primed: Whether to include in-context clinical format priming exemplar.
 
     Returns:
         List of PromptItem instances ready for DiffuGRPO RL training or held-out evaluation.
@@ -258,7 +311,9 @@ def load_amboss_questions(
                 if split == "train" and is_eval:
                     continue
 
-            items.append(q.to_prompt_item(include_options=include_options))
+            items.append(
+                q.to_prompt_item(include_options=include_options, format_primed=format_primed)
+            )
         except Exception:
             # Skip unparseable files gracefully
             continue
@@ -329,16 +384,27 @@ class AmbossDifferentialReward(BaseReward):
     ) -> bool:
         """Determine whether the gold diagnosis matches the answer or differential.
 
-        Strict matching rules:
+        Strict clinical matching rules:
         1. Primary check: gold option letter (e.g. 'b' or '(b)' or 'option b') in <answer>.
-        2. Diagnosis string match: full normalized ground truth contained in extracted <answer>.
-        3. Differential tag recall: full normalized ground truth in <differential>.
-        4. NO fallback to full completion/think text (prevents rewarding dropped hypotheses).
-        5. NO asymmetric prefix matching (prevents 'acute' matching 'acute cholecystitis').
+        2. Exact match: normalized ground truth == normalized extracted text.
+        3. Word-bounded full phrase match: ground truth phrase appears with complete word boundaries
+           in <answer> or <differential> (e.g. r'\b' + re.escape(gt) + r'\b').
+           Prevents 'pain' matching 'painless'.
+        4. Token-level partial match (with length ratio >= 0.50):
+           All content tokens of the extracted candidate must be a non-empty subset of the gold diagnosis tokens.
+           Prevents 'cystitis' matching 'cholecystitis', 'carditis' matching 'myocarditis' or 'pericarditis',
+           while allowing legitimate compound partials like 'Cholecystitis' for 'Acute cholecystitis'.
+        5. STRICT: NO fallback to general completion/<think> text.
         """
-        norm_gt = _normalize_text(ground_truth)
-        if not norm_gt:
+        gt_clean = ground_truth.strip()
+        if not gt_clean:
             return False
+
+        gt_lower = gt_clean.lower()
+        norm_gt = _normalize_text(gt_clean)
+        gt_tokens = _diagnosis_tokens(gt_clean)
+        if not gt_tokens:
+            gt_tokens = set(re.findall(r"[a-zA-Z0-9]+", gt_lower))
 
         # Extract gold option letter if available
         gold_letter = ""
@@ -348,47 +414,63 @@ class AmbossDifferentialReward(BaseReward):
                     gold_letter = str(opt.get("letter", "")).strip().lower()
                     break
 
+        def _is_text_matching_gold(candidate_text: str) -> bool:
+            cand_strip = candidate_text.strip()
+            if not cand_strip:
+                return False
+            cand_lower = cand_strip.lower()
+            norm_cand = _normalize_text(cand_strip)
+
+            # A. Option letter match in candidate text
+            if gold_letter:
+                tokens = set(re.findall(r"[a-zA-Z0-9]+", cand_lower))
+                if gold_letter in tokens or norm_cand == gold_letter:
+                    return True
+                if f"({gold_letter})" in cand_lower or f"option {gold_letter}" in cand_lower:
+                    return True
+
+            # B. Exact string match (ignoring punctuation/case)
+            if norm_gt and norm_cand and norm_gt == norm_cand:
+                return True
+
+            # C. Word-bounded full phrase match
+            # e.g. "Streptococcus pneumoniae" in "The diagnosis is Streptococcus pneumoniae"
+            # Crucially prevents "pain" matching "painless" via \b
+            if re.search(rf"\b{re.escape(gt_lower)}\b", cand_lower):
+                return True
+
+            # D. Token-level subset partial match for multi-word diseases
+            cand_tokens = _diagnosis_tokens(cand_strip)
+            if not cand_tokens:
+                cand_tokens = set(re.findall(r"[a-zA-Z0-9]+", cand_lower))
+
+            # Reject if candidate tokens consist solely of generic clinical head nouns
+            if cand_tokens.issubset(GENERIC_CLINICAL_HEAD_NOUNS):
+                return False
+
+            if cand_tokens and cand_tokens.issubset(gt_tokens):
+                char_ratio = sum(len(t) for t in cand_tokens) / max(1, sum(len(t) for t in gt_tokens))
+                if char_ratio >= 0.50:
+                    return True
+
+            return False
+
         # 1. Check <answer> tag
-        extracted = self.extract_answer(completion)
-        if extracted is not None:
-            norm_ext = _normalize_text(extracted)
-            ext_lower = extracted.lower().strip()
+        extracted_answer = self.extract_answer(completion)
+        if extracted_answer is not None and _is_text_matching_gold(extracted_answer):
+            return True
 
-            # Primary: Check option letter matching in <answer>
-            if gold_letter:
-                tokens = set(re.findall(r"[a-zA-Z0-9]+", ext_lower))
-                if gold_letter in tokens or norm_ext == gold_letter:
-                    return True
-                # Match '(b)' or 'b.' or 'option b'
-                if f"({gold_letter})" in ext_lower or f"option {gold_letter}" in ext_lower:
-                    return True
-
-            # Secondary: Exact or full-containment match with ground truth
-            # NOTE: Only norm_gt in norm_ext (extracted answer contains gold), NEVER norm_ext in norm_gt
-            if norm_gt and norm_gt in norm_ext:
-                return True
-
-        # 2. Check <differential> tag (candidate set recall)
+        # 2. Check <differential> tag
         diff_text = self.extract_differential(completion)
-        if diff_text is not None:
-            norm_diff = _normalize_text(diff_text)
-            diff_lower = diff_text.lower()
-            if norm_gt and norm_gt in norm_diff:
-                return True
-            if gold_letter:
-                diff_tokens = set(re.findall(r"[a-zA-Z0-9]+", diff_lower))
-                if gold_letter in diff_tokens:
-                    return True
+        if diff_text is not None and _is_text_matching_gold(diff_text):
+            return True
 
-        # STRICT: No fallback to general completion/<think> text.
-        # If the model merely considered the diagnosis in <think> without confirming
-        # it in <answer> or listing it in <differential>, gold is NOT matched.
         return False
 
     def _is_negation_violated(self, rationale: str, context_text: str, keyword: str) -> bool:
         """Check if rationale specifies an absence but context affirms presence."""
         rat_lower = rationale.lower()
-        neg_indicators = ["no ", "without ", "lacks ", "absent ", "absence of ", "negative "]
+        neg_indicators = ["no ", "without ", "lacks ", "absent ", "absence of ", "negative ", "denies "]
         is_negated_rationale = any(ind in rat_lower for ind in neg_indicators)
         if not is_negated_rationale:
             return False
@@ -401,12 +483,60 @@ class AmbossDifferentialReward(BaseReward):
             r"\bnotable\b",
         ]
         # Iterate over all occurrences of keyword in context, checking each preceding window
-        kw_indices = [m.start() for m in re.finditer(re.escape(keyword.lower()), ctx_lower)]
+        kw_indices = [m.start() for m in re.finditer(rf"\b{re.escape(keyword.lower())}\b", ctx_lower)]
         for kw_idx in kw_indices:
             prefix = ctx_lower[max(0, kw_idx - 40) : kw_idx]
             if any(re.search(pat, prefix) for pat in affirm_patterns):
                 return True
         return False
+
+    def _has_nearby_contrast(self, model_text: str, matching_kws: List[str], window: int) -> bool:
+        """Return True if a contrast marker is within `window` words of a matched keyword."""
+        words = re.findall(r"[a-zA-Z0-9_\-]+", model_text.lower())
+        if not words or not matching_kws:
+            return False
+        contrast_words = {
+            "but", "however", "unlike", "whereas", "not", "no", "without",
+            "lacks", "absence", "absent", "denies", "unlikely", "less", "lower",
+        }
+        kw_set = {str(k).lower() for k in matching_kws}
+        contrast_idx = [i for i, w in enumerate(words) if w in contrast_words]
+        if not contrast_idx:
+            return False
+        kw_idx = [i for i, w in enumerate(words) if w in kw_set]
+        return any(abs(k - c) <= window for k in kw_idx for c in contrast_idx)
+
+    def _is_ruleout_valid(self, rationale: str, model_text: str, matching_kws: List[str], require_proximity: bool = False) -> bool:
+        """Validate that the model's reasoning establishes legitimate distractor rule-out.
+
+        1. Contrast/Negation in Model Text:
+           The model cannot merely regurgitate distractor features (e.g. 'H. ducreyi: painful ulcers').
+           The model's text must contain a contrast or negation marker indicating that the patient
+           lacks the distractor's features or that the distractor is contrasted against the patient:
+           {but, however, unlike, whereas, not, no, without, lacks, absent, absence, denies, unlikely}.
+           Crucially, this is checked on the MODEL's text (not the AMBOSS rationale). Even if the
+           AMBOSS rationale contains 'unlike' or 'no', the model itself must provide the contrast/negation.
+
+        2. Negation Scope Check (Absence Violation):
+           If the distractor rationale explicitly states an absence (e.g. 'no lymphadenopathy'),
+           the model must NOT affirm presence ('shows prominent lymphadenopathy').
+        """
+        # 1. Check if the distractor rationale asserts an absence that the model affirmed
+        for kw in matching_kws:
+            if self._is_negation_violated(rationale, model_text, kw):
+                return False
+
+        # 2. The model's own text must contain contrast or negation markers
+        contrast_patterns = [
+            r"\bbut\b", r"\bhowever\b", r"\bunlike\b", r"\bwhereas\b",
+            r"\bnot\b", r"\bno\b", r"\bwithout\b", r"\blacks\b",
+            r"\babsence of\b", r"\babsence\b", r"\babsent\b", r"\bdenies\b",
+            r"\bunlikely\b", r"\bless\b", r"\blower\b",
+        ]
+        if require_proximity:
+            return self._has_nearby_contrast(model_text, matching_kws, self.proximity_word_window)
+        model_lower = model_text.lower()
+        return any(re.search(pat, model_lower) for pat in contrast_patterns)
 
     def compute_reward(
         self,
@@ -474,9 +604,10 @@ class AmbossDifferentialReward(BaseReward):
             # Extract discriminative keywords from the rationale
             if isinstance(rationale, (list, set, tuple)):
                 kws = {
-                    str(k).lower().strip()
+                    str(k).strip().lower()
                     for k in rationale
                     if len(str(k).strip()) >= self.min_keyword_length
+                    or str(k).strip().upper() in SHORT_CLINICAL_ALLOWLIST
                 }
             else:
                 kws = _extract_keywords(
@@ -492,11 +623,13 @@ class AmbossDifferentialReward(BaseReward):
             distractor_verified = False
             for target_norm, block_content in explicit_ruleouts.items():
                 if cand_norm in target_norm or target_norm in cand_norm:
-                    matching_in_block = [kw for kw in kws if kw in block_content]
-                    if matching_in_block:
-                        if not any(self._is_negation_violated(str(rationale), block_content, kw) for kw in matching_in_block):
-                            distractor_verified = True
-                            break
+                    matching_in_block = [
+                        kw for kw in kws
+                        if re.search(rf"\b{re.escape(kw)}\b", block_content)
+                    ]
+                    if matching_in_block and self._is_ruleout_valid(str(rationale), block_content, matching_in_block):
+                        distractor_verified = True
+                        break
 
             # B. Check proximity window around candidate mention in reasoning_text
             if not distractor_verified and cand_str:
@@ -507,18 +640,22 @@ class AmbossDifferentialReward(BaseReward):
                         start_pos = max(0, idx - self.proximity_word_window)
                         end_pos = min(len(reasoning_words), idx + self.proximity_word_window)
                         window_text = " ".join(reasoning_words[start_pos:end_pos])
-                        matching_kws = [kw for kw in kws if kw in window_text]
-                        if matching_kws:
-                            if not any(self._is_negation_violated(str(rationale), window_text, kw) for kw in matching_kws):
-                                distractor_verified = True
-                                break
+                        matching_kws = [
+                            kw for kw in kws
+                            if re.search(rf"\b{re.escape(kw)}\b", window_text)
+                        ]
+                        if matching_kws and self._is_ruleout_valid(str(rationale), window_text, matching_kws, require_proximity=True):
+                            distractor_verified = True
+                            break
 
             # C. Fallback: if candidate name is not in prompt metadata, require at least 2 keywords
             if not distractor_verified and not cand_str:
-                matching_kws = [kw for kw in kws if kw in reasoning_lower]
-                if len(matching_kws) >= 2:
-                    if not any(self._is_negation_violated(str(rationale), reasoning_lower, kw) for kw in matching_kws):
-                        distractor_verified = True
+                matching_kws = [
+                    kw for kw in kws
+                    if re.search(rf"\b{re.escape(kw)}\b", reasoning_lower)
+                ]
+                if len(matching_kws) >= 2 and self._is_ruleout_valid(str(rationale), reasoning_lower, matching_kws, require_proximity=True):
+                    distractor_verified = True
 
             if distractor_verified:
                 matched_ruleouts += 1
