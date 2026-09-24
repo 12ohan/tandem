@@ -236,6 +236,12 @@ def parse_args(args: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Directory containing Amboss question JSON files",
     )
     parser.add_argument("--skip-preflight", action="store_true", help="Skip in-process pre-flight sanity gates")
+    parser.add_argument(
+        "--empty-cache-interval",
+        type=int,
+        default=0,
+        help="Call torch.mps.empty_cache() every N steps (0 disables; default 0 avoids MPS emptyCache hangs)",
+    )
     return parser.parse_args(args)
 
 
@@ -306,6 +312,7 @@ def train(args: argparse.Namespace) -> None:
         hint_fraction=args.hint_fraction,
         hint_anneal_steps=args.hint_anneal_steps,
         save_dir=args.save_dir,
+        empty_cache_interval=args.empty_cache_interval,
         log_interval=args.log_every,
     )
 

@@ -42,7 +42,7 @@ class GRPOTrainerConfig:
     max_hint_retries: int = 1  # Maximum curriculum retry attempts per prompt
     mask_gold_in_hint: bool = True  # Strictly screens and masks gold answer tokens from injected hints
     hint_anneal_steps: Optional[int] = None  # Steps over which hint probability linearly decays to 0.0
-    empty_cache_interval: int = 1
+    empty_cache_interval: int = 0  # 0 disables MPS empty_cache (avoids Metal emptyCache hangs)
     log_interval: int = 1
     save_dir: Optional[str] = None
 

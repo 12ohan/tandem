@@ -147,6 +147,7 @@ def test_train_amboss_parse_args_defaults():
     assert args.format_primed is False
     assert args.skip_preflight is False
     assert args.normalize_by_std is True
+    assert args.empty_cache_interval == 0
 
 
 def test_train_amboss_parse_args_custom():
