@@ -2,63 +2,90 @@ from __future__ import annotations
 
 import pytest
 from tandem.rl.reward import (
-    FormatReward,
-    RegexMatchReward,
-    LengthPenaltyReward,
     CompositeReward,
+    FormatReward,
+    MathCorrectnessReward,
+    RegexMatchReward,
+    TokenValidityReward,
 )
 
 
+def test_token_validity_reward():
+    eos_ids = {2, 131070}
+    mask_id = 131071
+    reward_fn = TokenValidityReward(mask_token_id=mask_id, eos_token_ids=eos_ids, require_terminal_eos=True)
+
+    # 1. Valid clean termination
+    valid_tokens = [10, 20, 30, 2]
+    assert reward_fn("prompt", "text", token_ids=valid_tokens) == 1.0
+
+    # 2. Reject if mask_token_id is present
+    masked_tokens = [10, mask_id, 30, 2]
+    assert reward_fn("prompt", "text", token_ids=masked_tokens) == 0.0
+
+    # 3. Reject if EOS appears mid-sequence
+    mid_eos_tokens = [10, 2, 30, 40]
+    assert reward_fn("prompt", "text", token_ids=mid_eos_tokens) == 0.0
+
+    # 4. Reject if terminal EOS is missing when require_terminal_eos=True
+    truncated_tokens = [10, 20, 30, 40]
+    assert reward_fn("prompt", "text", token_ids=truncated_tokens) == 0.0
+
+
+def test_math_correctness_reward():
+    reward_fn = MathCorrectnessReward()
+
+    # 1. Answer in <answer> tags
+    comp1 = "<think>Compute 2+2</think><answer>4</answer>"
+    assert reward_fn("What is 2+2?", comp1, ground_truth="4") == 1.0
+    assert reward_fn("What is 2+2?", comp1, ground_truth="5") == 0.0
+
+    # 2. Answer in \boxed{}
+    comp2 = "Therefore, the result is \\boxed{ 42 }."
+    assert reward_fn("Find x", comp2, ground_truth="42") == 1.0
+
+    # 3. Answer with ####
+    comp3 = "Step by step solution... #### 100"
+    assert reward_fn("Find value", comp3, ground_truth="100") == 1.0
+
+    # 4. Float comparison equivalence
+    comp4 = "<answer>3.14159</answer>"
+    assert reward_fn("pi", comp4, ground_truth="3.141590") == 1.0
+
+
 def test_format_reward_correct():
-    reward_fn = FormatReward()
-    completion = "<think>Let me analyze the problem step by step.</think><answer>42</answer>"
-    score = reward_fn("Prompt", completion)
-    assert score == 1.0
+    reward = FormatReward()
+    completion = "<think>Let me analyze the problem.</think><answer>42</answer>"
+    score = reward.compute_reward("prompt", completion)
+    assert score == 1.0  # 0.5 think + 0.5 answer
 
 
 def test_format_reward_missing_think():
-    reward_fn = FormatReward()
-    completion = "The answer is <answer>42</answer>"
-    score = reward_fn("Prompt", completion)
-    assert score == 0.5  # only answer reward
+    reward = FormatReward()
+    completion = "<answer>42</answer>"
+    score = reward.compute_reward("prompt", completion)
+    assert score == 0.5  # only answer
 
 
 def test_format_reward_inverted_tags():
-    reward_fn = FormatReward()
-    completion = "<answer>42</answer><think>Wait I solved it first</think>"
-    score = reward_fn("Prompt", completion)
-    # Think was after answer: think gets +0.5, but answer check requires think <= answer -> no answer reward
-    assert score == 0.5
+    reward = FormatReward()
+    completion = "<answer>42</answer><think>Wait let me think</think>"
+    score = reward.compute_reward("prompt", completion)
+    assert score == 0.5  # think follows answer, so answer bonus not awarded
 
 
 def test_regex_match_reward():
-    reward_fn = RegexMatchReward()
-    completion = "<think>Calculating 2+2</think> The result is \\boxed{4}."
-    score = reward_fn("What is 2+2?", completion, target="4")
-    assert score == 1.0
-
-    score_wrong = reward_fn("What is 2+2?", completion, target="5")
-    assert score_wrong == 0.0
-
-
-def test_length_penalty_reward():
-    reward_fn = LengthPenaltyReward(max_length=50, penalty_weight=0.1)
-    short_text = "Short answer"
-    assert reward_fn("Prompt", short_text) == 0.0
-
-    long_text = "A" * 70  # 20 chars over budget
-    assert reward_fn("Prompt", long_text) == pytest.approx(-2.0)
+    reward = RegexMatchReward(pattern=r"\\boxed\{([^}]+)\}")
+    comp_match = "The solution is \\boxed{42}."
+    assert reward.compute_reward("prompt", comp_match, ground_truth="42") == 1.0
+    assert reward.compute_reward("prompt", comp_match, ground_truth="99") == 0.0
 
 
 def test_composite_reward():
-    fmt = FormatReward(think_reward=0.5, answer_reward=0.5)
-    regex = RegexMatchReward(match_reward=1.0)
-    composite = CompositeReward([(fmt, 0.4), (regex, 0.6)])
-
-    # Perfect format + correct answer: 0.4 * 1.0 + 0.6 * 1.0 = 1.0
-    good_completion = "<think>logic</think><answer>\\boxed{42}</answer>"
-    assert composite("Prompt", good_completion, target="42") == pytest.approx(1.0)
-
-    # Format ok, but wrong answer: 0.4 * 1.0 + 0.6 * 0.0 = 0.4
-    wrong_completion = "<think>logic</think><answer>\\boxed{99}</answer>"
-    assert composite("Prompt", wrong_completion, target="42") == pytest.approx(0.4)
+    comp_reward = CompositeReward([
+        (FormatReward(), 0.5),
+        (MathCorrectnessReward(), 0.5),
+    ])
+    full_pass = "<think>Reasoning</think><answer>42</answer>"
+    score = comp_reward.compute_reward("prompt", full_pass, ground_truth="42")
+    assert score == 1.0

@@ -3,14 +3,14 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
 import torch
 import torch.nn.functional as F
 
 from tandem.rl.dataset import PromptDataset, PromptItem
 from tandem.rl.diffu_grpo import GRPOMetrics, compute_group_advantages, compute_grpo_loss
 from tandem.rl.reward import BaseReward
-from tandem.rl.trajectory import Trajectory
+from tandem.rl.trajectory import Trajectory, TrajectoryCollector
 
 
 @dataclass
@@ -23,11 +23,14 @@ class GRPOTrainerConfig:
     clip_eps: float = 0.2
     beta_kl: float = 0.04
     max_grad_norm: float = 1.0
-    temperature: float = 0.7
+    temperature: float = 1.0  # Default fixed to tau=1.0 per Phase 4 contract
     max_new_tokens: int = 128
     block_size: int = 4
     batch_size: int = 1
     grad_accum_steps: int = 1
+    normalize_by_std: bool = True  # Flag to disable std-normalization (Dr. GRPO critique)
+    divisor_mode: Literal["token_mean", "group_mean"] = "token_mean"
+    format_failure_reward: float = 0.0  # Reward assigned when policy drifts to commit mask_token
     train_head_only: bool = False
     empty_cache_interval: int = 1
     log_interval: int = 1
@@ -105,30 +108,62 @@ class DiffuGRPOTrainer:
         # Run rollouts under no_grad to conserve Apple Silicon memory
         with torch.no_grad():
             for _ in range(G):
-                out = self.engine.generate(
-                    prompt=prompt_item.prompt,
-                    max_new_tokens=self.config.max_new_tokens,
-                    block_size=self.config.block_size,
-                    temperature=self.config.temperature,
-                    return_logprob=True,
-                )
-                completions.append(out.text)
-                acceptance_rates.append(out.acceptance_rate)
-                assert out.trajectory is not None, "Trajectory must be recorded for GRPO rollouts"
-                trajectories.append(out.trajectory)
+                try:
+                    out = self.engine.generate(
+                        prompt=prompt_item.prompt,
+                        max_new_tokens=self.config.max_new_tokens,
+                        block_size=self.config.block_size,
+                        temperature=self.config.temperature,
+                        return_logprob=True,
+                    )
+                    completions.append(out.text)
+                    acceptance_rates.append(out.acceptance_rate)
+                    assert out.trajectory is not None, "Trajectory must be recorded for GRPO rollouts"
+                    trajectories.append(out.trajectory)
 
-                # Compute scalar reward using pluggable evaluator
-                score = self.reward_fn(
-                    prompt=prompt_item.prompt,
-                    completion=out.text,
-                    ground_truth=prompt_item.ground_truth,
-                    **prompt_item.metadata,
-                )
-                rewards_list.append(float(score))
+                    # Compute scalar reward using pluggable evaluator (with token_ids)
+                    score = self.reward_fn(
+                        prompt=prompt_item.prompt,
+                        completion=out.text,
+                        token_ids=out.token_ids,
+                        ground_truth=prompt_item.ground_truth,
+                        **prompt_item.metadata,
+                    )
+                    rewards_list.append(float(score))
+
+                except RuntimeError as e:
+                    # §D: Catch mask_id commitment gracefully during policy drift
+                    if "mask token" in str(e).lower():
+                        failed_text = "<failed_mask_token_commitment>"
+                        completions.append(failed_text)
+                        acceptance_rates.append(0.0)
+
+                        # Encode prompt tokens for dummy failed trajectory
+                        if hasattr(self.engine.runner, "tokenizer"):
+                            prompt_toks = self.engine.runner.tokenizer.encode(
+                                prompt_item.prompt, add_special_tokens=False
+                            )
+                        else:
+                            prompt_toks = [1]
+
+                        failed_col = TrajectoryCollector(
+                            prompt_toks, temperature=self.config.temperature
+                        )
+                        # Append the mask token with a large negative logprob
+                        mask_id = getattr(self.engine.runner, "mask_token_id", 131071)
+                        failed_col.append_step(token_id=mask_id, logprob=-20.0, entropy=0.0)
+                        trajectories.append(failed_col.to_trajectory())
+
+                        # Assign format failure penalty
+                        rewards_list.append(float(self.config.format_failure_reward))
+                    else:
+                        raise e
 
         device = self.engine.runner.device
         rewards = torch.tensor(rewards_list, dtype=torch.float32, device=device)
-        advantages = compute_group_advantages(rewards)
+        advantages = compute_group_advantages(
+            rewards, normalize_by_std=self.config.normalize_by_std
+        )
 
         mean_r = float(rewards.mean().item())
         std_r = float(rewards.std(unbiased=False).item())
@@ -175,11 +210,13 @@ class DiffuGRPOTrainer:
             # Causal forward pass with autograd active
             logits, _ = self.engine.runner.forward_causal(input_ids, use_cache=False)
 
-            # Slicing: Logits predicting completion tokens c_0..c_{T-1} are at indices P-1..P+T-2
+            # §A.3 Discipline: Logits predicting completion tokens c_0..c_{T-1}
+            # row_i = P - 1 + i, so slice is [P - 1 : P + T - 1]
             comp_logits = logits[0, P - 1 : P + T - 1, :]
             target_ids = torch.tensor(c_tokens, dtype=torch.long, device=device)
 
-            temp = self.config.temperature
+            # Use recorded trajectory temperature (§A.1 operationalization)
+            temp = traj.temperature
             if temp > 0:
                 log_probs = F.log_softmax(comp_logits / max(temp, 1e-5), dim=-1)
             else:
@@ -211,6 +248,7 @@ class DiffuGRPOTrainer:
             ref_logprobs=ref_logprobs,
             clip_eps=self.config.clip_eps,
             beta_kl=self.config.beta_kl,
+            divisor_mode=self.config.divisor_mode,
         )
 
         return loss, metrics

@@ -42,21 +42,25 @@ class TinyMockRunner:
 
 
 class TinyMockEngine:
-    def __init__(self, runner: TinyMockRunner):
+    def __init__(self, runner: TinyMockRunner, should_fail_mask: bool = False):
         self.runner = runner
+        self.should_fail_mask = should_fail_mask
 
     def generate(
         self,
         prompt: str,
         max_new_tokens: int = 8,
         block_size: int = 2,
-        temperature: float = 0.7,
+        temperature: float = 1.0,
         return_logprob: bool = True,
     ) -> GenerationOutput:
-        # Deterministic dummy completions for testing
+        if self.should_fail_mask:
+            raise RuntimeError(
+                f"Causal verification policy committed mask token {self.runner.mask_token_id}"
+            )
+
         prompt_tokens = [1, 2, 3]
         if "box" in prompt.lower():
-            # Produce completion with \boxed{42}
             text = "Answer is \\boxed{42}"
             comp_tokens = [10, 11, 12, 13]
         elif "think" in prompt.lower():
@@ -66,7 +70,7 @@ class TinyMockEngine:
             text = "Generic completion text"
             comp_tokens = [30, 31, 32]
 
-        collector = TrajectoryCollector(prompt_tokens)
+        collector = TrajectoryCollector(prompt_tokens, temperature=temperature)
         for tok in comp_tokens:
             collector.append_step(token_id=tok, logprob=-1.25, entropy=0.5)
 
@@ -88,7 +92,7 @@ def test_trainer_rollout_group():
     engine = TinyMockEngine(runner)
     reward_fn = RegexMatchReward(pattern=r"\\boxed\{([^}]+)\}")
 
-    config = GRPOTrainerConfig(group_size=4, temperature=0.7)
+    config = GRPOTrainerConfig(group_size=4, temperature=1.0)
     trainer = DiffuGRPOTrainer(engine=engine, reward_fn=reward_fn, config=config)
 
     item = PromptItem(prompt="Find x in \\boxed{42}", ground_truth="42")
@@ -101,6 +105,67 @@ def test_trainer_rollout_group():
     assert torch.all(rollout.rewards == 1.0)
     # Identical rewards produce zero advantage
     assert torch.all(rollout.advantages == 0.0)
+    # Assert trajectory recorded temperature
+    assert rollout.trajectories[0].temperature == 1.0
+
+
+def test_trainer_catches_mask_token_gracefully():
+    """Verify §D: degenerate rollout committing mask_token_id is caught gracefully in rollout harness,
+    assigning format_failure_reward without killing the training run.
+    """
+    model = TinyMockModel()
+    runner = TinyMockRunner(model)
+    engine = TinyMockEngine(runner, should_fail_mask=True)
+    reward_fn = FormatReward()
+
+    config = GRPOTrainerConfig(group_size=2, format_failure_reward=-1.0)
+    trainer = DiffuGRPOTrainer(engine=engine, reward_fn=reward_fn, config=config)
+
+    item = PromptItem(prompt="Generate tokens")
+    # Must not raise RuntimeError
+    rollout = trainer.rollout_group(item)
+
+    assert len(rollout.completions) == 2
+    assert "<failed_mask_token_commitment>" in rollout.completions[0]
+    assert rollout.rewards[0].item() == -1.0
+
+
+def test_trainer_on_policy_ratio_near_one():
+    """Verify §A.4: teacher-forcing at behavior policy yields r_{i,t} == 1.0 exactly in float32."""
+    model = TinyMockModel()
+    runner = TinyMockRunner(model)
+    engine = TinyMockEngine(runner)
+    reward_fn = FormatReward()
+
+    trainer = DiffuGRPOTrainer(engine=engine, reward_fn=reward_fn)
+
+    # Compute exact teacher-forced logits from the model
+    prompt_tokens = [1, 2, 3]
+    comp_tokens = [20, 21, 22]
+    full_tokens = prompt_tokens + comp_tokens
+    with torch.no_grad():
+        logits = model(torch.tensor([full_tokens]))
+        P = len(prompt_tokens)
+        T = len(comp_tokens)
+        comp_logits = logits[0, P - 1 : P + T - 1, :]
+        log_probs = F.log_softmax(comp_logits, dim=-1)
+        exact_logprobs = log_probs[torch.arange(T), torch.tensor(comp_tokens)].tolist()
+
+    # Create trajectory with exact teacher-forced logprobs
+    collector = TrajectoryCollector(prompt_tokens, temperature=1.0)
+    for tok, lp in zip(comp_tokens, exact_logprobs):
+        collector.append_step(tok, lp)
+
+    traj = collector.to_trajectory()
+    rollout = trainer.rollout_group(PromptItem(prompt="test"))
+    rollout.trajectories = [traj]
+    rollout.advantages = torch.tensor([1.0])
+
+    loss, metrics = trainer.compute_rollout_loss(rollout)
+
+    # Policy loss for ratio = 1.0 with advantage = 1.0 must be -1.0
+    assert loss.item() == pytest.approx(-1.0, abs=1e-5)
+    assert metrics.clip_fraction == 0.0
 
 
 def test_trainer_compute_loss_differentiable():
@@ -109,7 +174,7 @@ def test_trainer_compute_loss_differentiable():
     engine = TinyMockEngine(runner)
     reward_fn = FormatReward()
 
-    config = GRPOTrainerConfig(group_size=2, temperature=0.7)
+    config = GRPOTrainerConfig(group_size=2, temperature=1.0)
     trainer = DiffuGRPOTrainer(engine=engine, reward_fn=reward_fn, config=config)
 
     item = PromptItem(prompt="Show your work with think tags")
@@ -139,13 +204,10 @@ def test_trainer_step_and_parameter_update():
     config = GRPOTrainerConfig(group_size=2, learning_rate=0.01)
     trainer = DiffuGRPOTrainer(engine=engine, reward_fn=reward_fn, config=config)
 
-    initial_head_weight = model.diffusion_head.weight.clone()
-
     batch = [
         PromptItem(prompt="Think step 1"),
         PromptItem(prompt="Think step 2"),
     ]
-    # Manually assign varying rewards across rollouts by mocking rollout_group advantages
     step_metrics = trainer.step(batch)
 
     assert "loss" in step_metrics
@@ -180,14 +242,12 @@ def test_trainer_save_and_load_weights(tmp_path):
     trainer = DiffuGRPOTrainer(engine=engine, reward_fn=reward_fn)
     checkpoint_file = tmp_path / "model_checkpoint.pt"
 
-    # Perturb weights
     with torch.no_grad():
         model.diffusion_head.weight.fill_(3.1415)
 
     trainer.save_weights(checkpoint_file)
     assert checkpoint_file.is_file()
 
-    # Reset weights
     with torch.no_grad():
         model.diffusion_head.weight.zero_()
 

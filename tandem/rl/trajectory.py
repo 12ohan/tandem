@@ -30,6 +30,7 @@ class Trajectory:
     prompt_tokens: List[int]
     steps: List[TrajectoryStep] = field(default_factory=list)
     completion_tokens: List[int] = field(default_factory=list)
+    temperature: float = 1.0
 
     
     @property
@@ -48,8 +49,9 @@ class Trajectory:
 class TrajectoryCollector:
     """Collects and validates DiffuGRPO RL trajectory channels in strict lockstep."""
 
-    def __init__(self, prompt_tokens: List[int]):
+    def __init__(self, prompt_tokens: List[int], temperature: float = 1.0):
         self.prompt_tokens = list(prompt_tokens)
+        self.temperature = float(temperature)
         self.steps: List[TrajectoryStep] = []
         self.completion_tokens: List[int] = []
 
@@ -98,4 +100,5 @@ class TrajectoryCollector:
             prompt_tokens=list(self.prompt_tokens),
             steps=list(self.steps),
             completion_tokens=list(self.completion_tokens),
+            temperature=self.temperature,
         )

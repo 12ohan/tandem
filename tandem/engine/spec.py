@@ -78,7 +78,11 @@ class TandemEngine:
             prompt_ids = prompt.to(device)
 
         prompt_len = prompt_ids.shape[1]
-        collector = TrajectoryCollector(prompt_ids[0].tolist()) if want_logprob else None
+        collector = (
+            TrajectoryCollector(prompt_ids[0].tolist(), temperature=temp if temp > 0 else 1.0)
+            if want_logprob
+            else None
+        )
 
         t0 = time.perf_counter()
         nfe = 0

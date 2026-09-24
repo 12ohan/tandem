@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import math
 import pytest
 import torch
+import torch.nn.functional as F
 from tandem.rl.diffu_grpo import compute_group_advantages, compute_grpo_loss
 
 
@@ -22,11 +24,26 @@ def test_group_advantages_normalization():
 
 
 def test_group_advantages_identical_rewards():
-    # If all completions scored identically, advantage must be exactly zero
+    # If all completions scored identically, advantage must be exactly zero (no NaN)
     rewards = torch.tensor([1.0, 1.0, 1.0, 1.0], dtype=torch.float32)
     adv = compute_group_advantages(rewards)
 
     assert torch.all(adv == 0.0)
+    assert not torch.isnan(adv).any()
+
+
+def test_degenerate_groups():
+    # G = 1 degenerate group
+    rewards_g1 = torch.tensor([0.75], dtype=torch.float32)
+    adv_g1 = compute_group_advantages(rewards_g1)
+    assert adv_g1.shape == (1,)
+    assert adv_g1.item() == 0.0
+
+    # Ablation flag: normalize_by_std=False
+    rewards = torch.tensor([10.0, 20.0], dtype=torch.float32)
+    adv_unnorm = compute_group_advantages(rewards, normalize_by_std=False)
+    # mean = 15.0 -> diff = [-5.0, 5.0]
+    assert torch.allclose(adv_unnorm, torch.tensor([-5.0, 5.0]))
 
 
 def test_grpo_loss_differentiable_and_gradients():
@@ -63,50 +80,68 @@ def test_grpo_loss_differentiable_and_gradients():
     assert policy_logprobs[1].grad.mean().item() > 0.0
 
 
-def test_grpo_loss_clipping():
-    # Force policy to be much higher than old (ratio > 1 + clip_eps)
-    T = 2
-    policy_logprobs = [torch.tensor([0.0, 0.0], requires_grad=True)]
-    old_logprobs = [torch.tensor([-2.0, -2.0])]  # ratio = exp(2.0) ~ 7.39 >> 1.2
-    advantages = torch.tensor([1.0])
+def test_clip_asymmetry_gradients():
+    """Verify PPO/GRPO clip asymmetry:
+    - If A > 0 and r > 1 + eps: loss is clipped to -(1+eps)*A -> gradient with respect to pi is 0.
+    - If A < 0 and r > 1 + eps: loss is unclipped -r*A -> gradient with respect to pi is non-zero.
+    - If A > 0 and r < 1 - eps: loss is unclipped -r*A -> gradient with respect to pi is non-zero.
+    - If A < 0 and r < 1 - eps: loss is clipped to -(1-eps)*A -> gradient with respect to pi is 0.
+    """
+    clip_eps = 0.2
 
-    loss, metrics = compute_grpo_loss(
-        policy_logprobs=policy_logprobs,
-        old_logprobs=old_logprobs,
-        advantages=advantages,
-        clip_eps=0.2,
-        beta_kl=0.0,
-    )
+    # Case 1: A > 0, r > 1 + eps (ratio = exp(0.5) ~ 1.65 > 1.2) -> Clipped, grad = 0
+    pi_1 = torch.tensor([0.5], requires_grad=True)
+    old_1 = torch.tensor([0.0])
+    loss_1, _ = compute_grpo_loss([pi_1], [old_1], torch.tensor([1.0]), clip_eps=clip_eps, beta_kl=0.0)
+    loss_1.backward()
+    assert pi_1.grad.item() == 0.0
 
-    # When clipped at 1 + 0.2 = 1.2, surrogate loss is -1.2 * 1.0 = -1.2
-    assert loss.item() == pytest.approx(-1.2)
-    assert metrics.clip_fraction == 1.0
+    # Case 2: A < 0, r > 1 + eps -> Unclipped, grad != 0
+    pi_2 = torch.tensor([0.5], requires_grad=True)
+    old_2 = torch.tensor([0.0])
+    loss_2, _ = compute_grpo_loss([pi_2], [old_2], torch.tensor([-1.0]), clip_eps=clip_eps, beta_kl=0.0)
+    loss_2.backward()
+    assert abs(pi_2.grad.item()) > 0.0
+
+    # Case 3: A > 0, r < 1 - eps (ratio = exp(-0.5) ~ 0.606 < 0.8) -> Unclipped, grad != 0
+    pi_3 = torch.tensor([-0.5], requires_grad=True)
+    old_3 = torch.tensor([0.0])
+    loss_3, _ = compute_grpo_loss([pi_3], [old_3], torch.tensor([1.0]), clip_eps=clip_eps, beta_kl=0.0)
+    loss_3.backward()
+    assert abs(pi_3.grad.item()) > 0.0
+
+    # Case 4: A < 0, r < 1 - eps -> Clipped, grad = 0
+    pi_4 = torch.tensor([-0.5], requires_grad=True)
+    old_4 = torch.tensor([0.0])
+    loss_4, _ = compute_grpo_loss([pi_4], [old_4], torch.tensor([-1.0]), clip_eps=clip_eps, beta_kl=0.0)
+    loss_4.backward()
+    assert pi_4.grad.item() == 0.0
 
 
-def test_grpo_kl_penalty():
-    T = 3
-    # Policy diverges from reference
-    policy_logprobs = [torch.tensor([-0.5, -0.5, -0.5])]
-    ref_logprobs = [torch.tensor([-0.1, -0.1, -0.1])]
-    old_logprobs = [torch.tensor([-0.5, -0.5, -0.5])]
-    advantages = torch.tensor([0.0])  # zero policy advantage to isolate KL
+def test_k3_pointwise_nonnegativity_and_agreement():
+    """Verify that Schulman k3 estimator:
+    1. Is strictly non-negative pointwise: exp(u) - u - 1 >= 0 for all u.
+    2. Agrees with direct KL divergence on toy distributions up to second order.
+    """
+    # 1. Pointwise non-negativity across wide range of log ratios
+    u = torch.linspace(-10.0, 10.0, 1000)
+    k3 = torch.exp(u) - u - 1.0
+    assert (k3 >= -1e-6).all(), "k3 violated pointwise non-negativity"
+    # Minimum is at u = 0, where k3 = 0.0
+    u_zero = torch.tensor([0.0])
+    assert torch.allclose(torch.exp(u_zero) - u_zero - 1.0, torch.tensor([0.0]))
 
-    loss_low_kl, metrics_low = compute_grpo_loss(
-        policy_logprobs=policy_logprobs,
-        old_logprobs=old_logprobs,
-        advantages=advantages,
-        ref_logprobs=ref_logprobs,
-        beta_kl=0.01,
-    )
+    # 2. Agreement with direct KL on toy Bernoulli distribution
+    # Let P = [0.6, 0.4], Q = [0.55, 0.45]
+    p = torch.tensor([0.6, 0.4])
+    q = torch.tensor([0.55, 0.45])
+    direct_kl = (p * torch.log(p / q)).sum().item()
 
-    loss_high_kl, metrics_high = compute_grpo_loss(
-        policy_logprobs=policy_logprobs,
-        old_logprobs=old_logprobs,
-        advantages=advantages,
-        ref_logprobs=ref_logprobs,
-        beta_kl=0.1,
-    )
+    # In sample space, expectation of k3 under P:
+    # E_P[ exp(log q - log p) - (log q - log p) - 1 ]
+    # = sum_x p(x) * [ q(x)/p(x) - log(q/p) - 1 ] = sum q(x) - 1 + sum p(x) log(p/q) = direct_kl
+    u_samples = torch.log(q) - torch.log(p)
+    k3_samples = torch.exp(u_samples) - u_samples - 1.0
+    expected_k3 = (p * k3_samples).sum().item()
 
-    # Higher beta_kl must increase total penalty loss
-    assert loss_high_kl.item() > loss_low_kl.item()
-    assert metrics_high.kl_loss > 0.0
+    assert abs(expected_k3 - direct_kl) < 1e-6

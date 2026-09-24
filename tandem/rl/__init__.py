@@ -4,8 +4,9 @@ from tandem.rl.reward import (
     BaseReward,
     CompositeReward,
     FormatReward,
-    LengthPenaltyReward,
+    MathCorrectnessReward,
     RegexMatchReward,
+    TokenValidityReward,
 )
 from tandem.rl.trainer import DiffuGRPOTrainer, GRPORollout, GRPOTrainerConfig
 from tandem.rl.trajectory import Trajectory, TrajectoryCollector, TrajectoryStep
@@ -15,8 +16,9 @@ __all__ = [
     "PromptDataset",
     "BaseReward",
     "FormatReward",
+    "MathCorrectnessReward",
     "RegexMatchReward",
-    "LengthPenaltyReward",
+    "TokenValidityReward",
     "CompositeReward",
     "compute_group_advantages",
     "compute_grpo_loss",

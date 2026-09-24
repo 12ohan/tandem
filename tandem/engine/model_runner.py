@@ -55,9 +55,11 @@ class TandemModelRunner:
         self.set_diffusion_mode(False)
         self.toggle_adapters(False)
 
+        enc_past = past_key_values if past_key_values is not None else (DynamicCache() if use_cache else None)
+
         enc_out = self.model.encoder(
             input_ids=input_ids,
-            past_key_values=past_key_values if past_key_values is not None else DynamicCache(),
+            past_key_values=enc_past,
             use_cache=use_cache,
             use_causal_mask=True,
         )
