@@ -3,7 +3,7 @@ from __future__ import annotations
 import random
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
 import torch
@@ -98,6 +98,19 @@ class DiffuGRPOTrainer:
 
         self.trainable_params = trainable_params
         self.global_step = 0
+        self.last_prompt_index = 0
+
+        # Validate reward magnitude dominance and derive dead-group threshold
+        gold_reward = getattr(self.reward_fn, "gold_reward", None)
+        max_ruleout = getattr(self.reward_fn, "max_ruleout_credit", None)
+        if gold_reward is not None and max_ruleout is not None:
+            assert gold_reward > max_ruleout, (
+                f"Reward magnitude dominance violated: gold_reward ({gold_reward}) "
+                f"must strictly exceed max_ruleout_credit ({max_ruleout})"
+            )
+            self.min_correct_threshold = float(gold_reward)
+        else:
+            self.min_correct_threshold = 2.0
 
         if optimizer is not None:
             self.optimizer = optimizer
@@ -279,9 +292,9 @@ class DiffuGRPOTrainer:
         )
 
         reward_span = max(rewards_list) - min(rewards_list) if rewards_list else 0.0
-        gold_threshold = getattr(self.reward_fn, "gold_reward", 2.0)
+        gold_threshold = getattr(self, "min_correct_threshold", getattr(self.reward_fn, "gold_reward", 2.0))
 
-        # Rescue condition: all-failed (max_r < 2.0), zero-variance (span < 1e-5), not all-truncated
+        # Rescue condition: all-failed (max_r < min_correct_threshold), zero-variance (span < 1e-5), not all-truncated
         # All-correct groups (min_r >= 2.0) are NOT hinted or re-rolled; they bypass rescue cleanly.
         if (
             self.config.curriculum_hint_on_zero
@@ -557,3 +570,78 @@ class DiffuGRPOTrainer:
             raise FileNotFoundError(f"Checkpoint not found: {path}")
         state_dict = torch.load(path, map_location=self.engine.runner.device)
         self.engine.runner.model.load_state_dict(state_dict, strict=False)
+
+    def save_checkpoint(
+        self,
+        path: Union[str, Path],
+        extra_state: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Save a complete resumable training checkpoint containing:
+        - Trainable model weights (diffusion_head or full requires_grad)
+        - Optimizer state dict (AdamW moments)
+        - Global step and RNG states (torch, python random, and mps if supported)
+        - Dataset cursor position (last_prompt_index)
+        - Trainer config
+        - Optional extra metadata (e.g. metrics history)
+        """
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        model_weights = {
+            name: param.detach().cpu()
+            for name, param in self.engine.runner.model.named_parameters()
+            if param.requires_grad
+        }
+        rng_state = {
+            "torch": torch.get_rng_state(),
+            "random": random.getstate(),
+        }
+        if hasattr(torch, "mps") and hasattr(torch.mps, "get_rng_state"):
+            try:
+                rng_state["mps"] = torch.mps.get_rng_state()
+            except Exception:
+                pass
+        if torch.cuda.is_available():
+            rng_state["cuda"] = torch.cuda.get_rng_state_all()
+
+        checkpoint = {
+            "model_state_dict": model_weights,
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "global_step": self.global_step,
+            "last_prompt_index": self.last_prompt_index,
+            "config": asdict(self.config),
+            "rng_state": rng_state,
+        }
+        if extra_state:
+            checkpoint.update(extra_state)
+            if "last_prompt_index" in extra_state:
+                self.last_prompt_index = extra_state["last_prompt_index"]
+        torch.save(checkpoint, path)
+
+    def load_checkpoint(self, path: Union[str, Path]) -> Dict[str, Any]:
+        """Load a complete checkpoint, restoring model weights, optimizer, step,
+        dataset cursor (last_prompt_index), and RNG states onto the trainer.
+        """
+        path = Path(path)
+        if not path.is_file():
+            raise FileNotFoundError(f"Checkpoint not found: {path}")
+        checkpoint = torch.load(path, map_location="cpu")
+        # Load model weights
+        self.engine.runner.model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+        # Load optimizer
+        if "optimizer_state_dict" in checkpoint and hasattr(self, "optimizer"):
+            self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        # Restore step and dataset cursor
+        self.global_step = checkpoint.get("global_step", 0)
+        self.last_prompt_index = checkpoint.get("last_prompt_index", 0)
+        # Restore RNG if present
+        rng = checkpoint.get("rng_state", {})
+        if "torch" in rng:
+            torch.set_rng_state(rng["torch"])
+        if "random" in rng:
+            random.setstate(rng["random"])
+        if "mps" in rng and hasattr(torch, "mps") and hasattr(torch.mps, "set_rng_state"):
+            try:
+                torch.mps.set_rng_state(rng["mps"])
+            except Exception:
+                pass
+        return checkpoint

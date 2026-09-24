@@ -232,6 +232,11 @@ def test_candidate_scorer_summary_output():
     assert "#1: 'acute cholecystitis'" in summary_text
 
 
+def test_candidate_scorer_no_score_differential_alias():
+    """Verify the dead score_differential name cannot creep back into the scorer API."""
+    assert not hasattr(CandidateDifferentialScorer, "score_differential")
+
+
 AMBOSS_QUESTIONS_DIR = Path(
     "/Users/rohanmaster/Library/Mobile Documents/com~apple~CloudDocs/Desktop/Resources/data/raw/amboss_qbank/questions"
 )

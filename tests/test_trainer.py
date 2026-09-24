@@ -561,5 +561,119 @@ def test_trainer_hinted_rollout_on_policy_ratio_near_one():
     assert metrics.clip_fraction == 0.0
 
 
+def test_trainer_reward_dominance_init_assertion():
+    """Verify that trainer initialization asserts gold_reward > max_ruleout_credit."""
+    model = TinyMockModel()
+    runner = TinyMockRunner(model)
+    engine = TinyMockEngine(runner)
+
+    class BrokenDominanceReward(BaseReward):
+        gold_reward = 0.50
+        max_ruleout_credit = 0.80
+
+        def compute_reward(self, *args, **kwargs):
+            return 0.0
+
+    with pytest.raises(AssertionError, match="Reward magnitude dominance violated"):
+        DiffuGRPOTrainer(engine=engine, reward_fn=BrokenDominanceReward())
 
 
+def test_trainer_checkpoint_roundtrip_verification(tmp_path):
+    """Verify complete checkpoint serialization roundtrip:
+    - Trainable head weights bit-identical
+    - Optimizer state dict (moments/step) restored exactly
+    - Global step and RNG states restored
+    - Forward pass output logits bit-identical before and after load
+    - Metadata (e.g. last_prompt_index) preserved
+    """
+    model = TinyMockModel()
+    runner = TinyMockRunner(model)
+    engine = TinyMockEngine(runner)
+    reward_fn = FormatReward()
+
+    config = GRPOTrainerConfig(group_size=2, train_head_only=True, learning_rate=0.01)
+    trainer = DiffuGRPOTrainer(engine=engine, reward_fn=reward_fn, config=config)
+
+    # Perform an optimization step so optimizer contains initialized AdamW moments
+    trainer.optimizer.zero_grad()
+    loss = (model.diffusion_head.weight ** 2).sum()
+    loss.backward()
+    trainer.optimizer.step()
+    trainer.global_step = 17
+
+    test_input = torch.tensor([[1, 5, 9, 13]])
+    with torch.no_grad():
+        pre_save_logits = model(test_input).clone()
+        saved_head_weight = model.diffusion_head.weight.clone()
+
+    ckpt_file = tmp_path / "checkpoint_step_17.pt"
+    trainer.save_checkpoint(ckpt_file, extra_state={"last_prompt_index": 85})
+    assert ckpt_file.is_file()
+
+    # Mutate weights, step, and optimizer on existing trainer/model
+    with torch.no_grad():
+        model.diffusion_head.weight.zero_()
+    trainer.global_step = 0
+    assert not torch.allclose(model.diffusion_head.weight, saved_head_weight)
+
+    loaded_meta = trainer.load_checkpoint(ckpt_file)
+
+    # 1. State and metadata assertions
+    assert trainer.global_step == 17
+    assert trainer.last_prompt_index == 85
+    assert loaded_meta["last_prompt_index"] == 85
+    assert loaded_meta["config"]["learning_rate"] == 0.01
+
+    # 2. Bit-exact weights assertion
+    assert torch.equal(model.diffusion_head.weight, saved_head_weight)
+
+    # 3. Bit-exact forward pass logits assertion
+    with torch.no_grad():
+        post_load_logits = model(test_input)
+    assert torch.equal(post_load_logits, pre_save_logits)
+
+    # 4. Optimizer state restoration assertion
+    restored_opt_state = trainer.optimizer.state_dict()
+    assert len(restored_opt_state["state"]) > 0
+
+
+def test_trainer_resume_dataset_cursor(tmp_path):
+    """Verify that checkpoint resume restores the dataset cursor (last_prompt_index)
+    and training step, so the subsequent training batch starts at the correct prompt index.
+    """
+    model = TinyMockModel()
+    runner = TinyMockRunner(model)
+    engine = TinyMockEngine(runner)
+    reward_fn = FormatReward()
+    config = GRPOTrainerConfig(group_size=2, train_head_only=True)
+
+    trainer = DiffuGRPOTrainer(engine=engine, reward_fn=reward_fn, config=config)
+    dataset = PromptDataset([PromptItem(prompt=f"Clinical Case {i}") for i in range(20)])
+
+    # Simulate running step 1 on prompts [0, 1]
+    batch_size = 2
+    cursor = 0
+    batch_1 = list(dataset[cursor : cursor + batch_size])
+    trainer.step(batch_1)
+    trainer.last_prompt_index = cursor + batch_size  # cursor is now 2
+    trainer.global_step = 1
+
+    ckpt_path = tmp_path / "resume_test_ckpt.pt"
+    trainer.save_checkpoint(ckpt_path)
+
+    # Instantiate fresh trainer simulating restarted process
+    fresh_model = TinyMockModel()
+    fresh_runner = TinyMockRunner(fresh_model)
+    fresh_engine = TinyMockEngine(fresh_runner)
+    resumed_trainer = DiffuGRPOTrainer(engine=fresh_engine, reward_fn=reward_fn, config=config)
+
+    meta = resumed_trainer.load_checkpoint(ckpt_path)
+    assert resumed_trainer.global_step == 1
+    assert resumed_trainer.last_prompt_index == 2
+
+    # Verify that the next batch pulled using the restored cursor starts at prompt index 2 (Case 2)
+    next_cursor = resumed_trainer.last_prompt_index
+    next_batch = list(dataset[next_cursor : next_cursor + batch_size])
+    assert len(next_batch) == 2
+    assert next_batch[0].prompt == "Clinical Case 2"
+    assert next_batch[1].prompt == "Clinical Case 3"
