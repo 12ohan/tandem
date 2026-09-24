@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 from tandem.engine.matcher import match_speculative_tokens
+from tandem.engine.model_runner import resolve_eos_token_ids
 from tandem.engine.sampler import sample_gumbel_max, sample_residual
 
 
@@ -187,5 +188,11 @@ def test_accounting_identity_and_boundary_clamping():
     alpha = useful_accepted / (R * K)
     assert alpha == 5 / 8 == 0.625
 
-
-
+def test_resolve_eos_token_ids_unions_sources():
+    class Tok:
+        eos_token_id = 11
+    class Cfg:
+        eos_token_id = [2, 11]
+    assert resolve_eos_token_ids(Tok(), Cfg()) == {2, 11}
+    assert resolve_eos_token_ids(Tok(), Cfg(), explicit_ids=[131070]) == {2, 11, 131070}
+    assert resolve_eos_token_ids(Tok(), type("C", (), {"eos_token_id": None})()) == {11}

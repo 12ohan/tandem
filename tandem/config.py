@@ -29,7 +29,7 @@ class EngineConfig:
     device: str = field(default_factory=get_default_device)
     dtype: Optional[torch.dtype] = None
     mask_id: int = 131071
-    eos_token_ids: List[int] = field(default_factory=lambda: [2, 131070])
+    eos_token_ids: List[int] = field(default_factory=list)
     
     # Speculative decoding parameters
     max_context_len: int = 16384

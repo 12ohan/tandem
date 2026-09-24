@@ -8,6 +8,23 @@ from transformers.cache_utils import DynamicCache
 from tandem.config import EngineConfig
 
 
+
+def resolve_eos_token_ids(tokenizer, model_config, explicit_ids=None) -> set[int]:
+    """Resolve EOS ids from tokenizer, model config, and explicit overrides."""
+    eos_ids: set[int] = set()
+    tok_eos = getattr(tokenizer, "eos_token_id", None)
+    if isinstance(tok_eos, int):
+        eos_ids.add(int(tok_eos))
+    cfg_eos = getattr(model_config, "eos_token_id", None)
+    if isinstance(cfg_eos, int):
+        eos_ids.add(int(cfg_eos))
+    elif isinstance(cfg_eos, (list, tuple, set)):
+        eos_ids.update(int(x) for x in cfg_eos if x is not None)
+    if explicit_ids:
+        eos_ids.update(int(x) for x in explicit_ids)
+    return eos_ids
+
+
 class TandemModelRunner:
     """Wraps Nemotron-Labs-Diffusion model for Apple Silicon (MPS/CPU) self-speculative execution."""
 
@@ -28,10 +45,9 @@ class TandemModelRunner:
         self.mask_token_id = getattr(
             self.model.config, "mask_token_id", config.mask_id
         )
-        if config.eos_token_ids:
-            self.eos_token_ids = set(config.eos_token_ids)
-        else:
-            self.eos_token_ids = {self.tokenizer.eos_token_id}
+        self.eos_token_ids = resolve_eos_token_ids(
+            self.tokenizer, self.model.config, config.eos_token_ids
+        )
 
     def set_diffusion_mode(self, enabled: bool) -> None:
         """Toggle bidirectional diffusion attention vs causal autoregressive attention."""
