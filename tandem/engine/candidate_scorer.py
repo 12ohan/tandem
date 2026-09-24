@@ -37,6 +37,7 @@ class DifferentialScoringResult:
     top_candidate: CandidateDifferentialScore
     entropy_bits: float
     temperature: float = 1.0
+    prefix_fallback_count: int = 0
 
     def summary(self) -> str:
         lines = [

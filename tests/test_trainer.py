@@ -27,12 +27,18 @@ class TinyMockModel(nn.Module):
         return self.diffusion_head(h)
 
 
+class MockTinyTokenizer:
+    def encode(self, text: str, add_special_tokens: bool = False) -> List[int]:
+        return [(abs(hash(w)) % 50) + 1 for w in text.split()] or [1]
+
+
 class TinyMockRunner:
     def __init__(self, model: nn.Module):
         self.model = model
         self.device = torch.device("cpu")
         self.mask_token_id = 63
         self.eos_token_ids = {0}
+        self.tokenizer = MockTinyTokenizer()
 
     def forward_causal(
         self, input_ids: torch.Tensor, past_key_values=None, use_cache=True
@@ -481,6 +487,79 @@ def test_trainer_dead_group_split_semantics():
     rollout_correct = trainer_correct.rollout_group(item)
     assert rollout_correct.prompt_item.metadata.get("curriculum_hint_applied") is None
     assert "Clinical Guidance:" not in rollout_correct.prompt_item.prompt
+
+
+def test_trainer_hinted_rollout_on_policy_ratio_near_one():
+    """Verify that hinted curriculum rollouts remain strictly on-policy:
+    Loss-time forward pass evaluates [augmented_prompt + completion] so r_t == 1.0 at theta_init.
+    """
+    model = TinyMockModel()
+    runner = TinyMockRunner(model)
+
+    class TeacherForcedHintEngine:
+        def __init__(self, runner):
+            self.runner = runner
+
+        def generate(self, prompt: str, **kwargs):
+            p_tokens = self.runner.tokenizer.encode(prompt, add_special_tokens=False)
+            c_tokens = [20, 21, 22]
+            full_toks = p_tokens + c_tokens
+
+            # Compute exact teacher-forced logprobs under the model at generation time
+            with torch.no_grad():
+                logits = self.runner.model(torch.tensor([full_toks]))
+                P = len(p_tokens)
+                T = len(c_tokens)
+                comp_logits = logits[0, P - 1 : P + T - 1, :]
+                log_probs = F.log_softmax(comp_logits, dim=-1)
+                exact_lps = log_probs[torch.arange(T), torch.tensor(c_tokens)].tolist()
+
+            collector = TrajectoryCollector(p_tokens, temperature=1.0)
+            for tok, lp in zip(c_tokens, exact_lps):
+                collector.append_step(tok, lp)
+
+            # Return without think tags on unhinted prompt, with think tags on hinted prompt
+            text = "<think>guided</think><answer>42</answer>" if "Clinical Guidance" in prompt else "unhinted wrong"
+            return GenerationOutput(
+                text=text,
+                token_ids=c_tokens,
+                num_generated_tokens=len(c_tokens),
+                num_forward_passes=1,
+                wall_time=0.01,
+                tok_per_sec=100.0,
+                acceptance_rate=1.0,
+                trajectory=collector.to_trajectory(),
+            )
+
+    engine = TeacherForcedHintEngine(runner)
+    reward_fn = FormatReward()  # 1.0 if <think> and <answer> else 0.0
+
+    config = GRPOTrainerConfig(group_size=2, curriculum_hint_on_zero=True, max_hint_retries=1)
+    trainer = DiffuGRPOTrainer(engine=engine, reward_fn=reward_fn, config=config)
+
+    item = PromptItem(
+        prompt="Initial vignette",
+        ground_truth="42",
+        metadata={"learning_objective": "Recognize key diagnostic feature"},
+    )
+
+    # Rollout will initially score 0.0, trigger hint rescue, and re-roll on augmented prompt
+    rollout = trainer.rollout_group(item)
+    assert rollout.prompt_item.metadata.get("curriculum_hint_applied") is True
+    assert "Clinical Guidance" in rollout.prompt_item.prompt
+
+    # Verify that the trajectory prompt tokens match the augmented prompt
+    expected_p_tokens = runner.tokenizer.encode(rollout.prompt_item.prompt, add_special_tokens=False)
+    assert rollout.trajectories[0].prompt_tokens == expected_p_tokens
+
+    # Verify that loss evaluation at theta_init produces policy loss matching exact r_t == 1.0
+    rollout.advantages = torch.tensor([1.0, 1.0])
+    loss, metrics = trainer.compute_rollout_loss(rollout)
+
+    # For r_t == 1.0 and adv == 1.0: surrogate is -1.0 * 1.0 = -1.0, clip fraction = 0.0
+    assert loss.item() == pytest.approx(-1.0, abs=1e-5)
+    assert metrics.clip_fraction == 0.0
+
 
 
 

@@ -279,7 +279,7 @@ class DiffuGRPOTrainer:
         )
 
         reward_span = max(rewards_list) - min(rewards_list) if rewards_list else 0.0
-        gold_threshold = 2.0  # Gold diagnosis award threshold
+        gold_threshold = getattr(self.reward_fn, "gold_reward", 2.0)
 
         # Rescue condition: all-failed (max_r < 2.0), zero-variance (span < 1e-5), not all-truncated
         # All-correct groups (min_r >= 2.0) are NOT hinted or re-rolled; they bypass rescue cleanly.

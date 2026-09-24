@@ -258,25 +258,41 @@ def test_candidate_scorer_real_weights_amboss():
         f"Precondition failed: gold answer '{item.ground_truth}' must be present in candidates"
     )
 
-    res = scorer.score_candidates(
+    # 1. Raw Likelihood Scoring
+    res_raw = scorer.score_candidates(
         item.prompt,
         candidates,
         prefix_template="\n<answer>",
     )
 
-    assert isinstance(res, DifferentialScoringResult)
-    assert len(res.candidates) == len(candidates)
-    assert res.top_candidate.rank == 1
+    # 2. Contrastive PMI Scoring (unconditional neutral context prior subtracted)
+    res_pmi = scorer.score_candidates(
+        item.prompt,
+        candidates,
+        prefix_template="\n<answer>",
+        neutral_context="The most likely diagnosis is:",
+    )
+
+    assert isinstance(res_raw, DifferentialScoringResult)
+    assert len(res_raw.candidates) == len(candidates)
+    assert res_raw.top_candidate.rank == 1
 
     # Verify every candidate has finite logprobs in [-20, 0]
-    for c in res.candidates:
+    for c in res_raw.candidates:
         assert torch.isfinite(torch.tensor(c.token_logprobs)).all()
         assert not any(math.isnan(lp) for lp in c.token_logprobs)
         assert -20.0 <= c.mean_logprob <= 0.0
 
-    print("\n" + "=" * 60)
-    print("REAL WEIGHTS CANDIDATE DIFFERENTIAL EVALUATION RECEIPT")
-    print("=" * 60)
-    print(res.summary())
-    print("=" * 60)
+    for c in res_pmi.candidates:
+        assert c.pmi_score is not None
+
+    print("\n" + "=" * 65)
+    print("REAL WEIGHTS 5-OPTION EVALUATION: RAW LIKELIHOOD")
+    print("=" * 65)
+    print(res_raw.summary())
+    print("=" * 65)
+    print("REAL WEIGHTS 5-OPTION EVALUATION: CONTRASTIVE PMI")
+    print("=" * 65)
+    print(res_pmi.summary())
+    print("=" * 65)
 

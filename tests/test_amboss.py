@@ -528,3 +528,141 @@ def test_amboss_deterministic_train_eval_split():
     assert len(train_items) > 0, "Train split must be non-empty"
     assert len(eval_items) > 0, "Eval split must be non-empty"
 
+
+# =====================================================================
+# 7. Adversarial Red-Team Reward Suite
+# =====================================================================
+
+def test_amboss_adversarial_affirmation_verbs():
+    """Verify that expanded affirmative verbs ('reveals', 'demonstrates', 'notable')
+    invalidate distractor rule-out credit when rationale asserts absence.
+    """
+    reward_fn = AmbossDifferentialReward(gate_on_gold=False)
+    gt = "Klebsiella granulomatis"
+    candidates = ["Treponema pallidum"]
+    buts = {"Treponema pallidum": "painless chancre without prominent lymphadenopathy"}
+
+    # Test verb: 'reveals'
+    comp_reveals = (
+        "<think>Treponema pallidum was considered, but physical examination reveals prominent lymphadenopathy.</think>"
+        "<answer>Klebsiella granulomatis</answer>"
+    )
+    score_reveals = reward_fn.compute_reward(
+        prompt="case", completion=comp_reveals, ground_truth=gt,
+        differential_candidates=candidates, distractor_buts=buts,
+    )
+    assert score_reveals == 2.0  # Only gold awarded; rule-out rejected due to affirmation breach
+
+    # Test verb: 'demonstrates'
+    comp_demonstrates = (
+        "<think>Treponema pallidum evaluation demonstrates severe lymphadenopathy.</think>"
+        "<answer>Klebsiella granulomatis</answer>"
+    )
+    score_demonstrates = reward_fn.compute_reward(
+        prompt="case", completion=comp_demonstrates, ground_truth=gt,
+        differential_candidates=candidates, distractor_buts=buts,
+    )
+    assert score_demonstrates == 2.0
+
+    # Test phrase: 'notable'
+    comp_notable = (
+        "<think>Treponema pallidum finding notable lymphadenopathy on groin exam.</think>"
+        "<answer>Klebsiella granulomatis</answer>"
+    )
+    score_notable = reward_fn.compute_reward(
+        prompt="case", completion=comp_notable, ground_truth=gt,
+        differential_candidates=candidates, distractor_buts=buts,
+    )
+    assert score_notable == 2.0
+
+
+def test_amboss_adversarial_keyword_stuffing_without_candidate():
+    """Verify that dumping rationale keywords without mentioning the candidate distractor earns zero rule-out credit."""
+    reward_fn = AmbossDifferentialReward(gate_on_gold=False)
+    gt = "Acute cholecystitis"
+    candidates = ["Acute appendicitis"]
+    buts = {"Acute appendicitis": "periumbilical pain migrating to McBurney point"}
+
+    # Completion dumps keywords ('migrating', 'mcburney') without ever naming 'appendicitis'
+    comp_stuffed = (
+        "<think>The examination shows migrating discomfort near mcburney area without clear cause.</think>"
+        "<answer>Acute cholecystitis</answer>"
+    )
+    score = reward_fn.compute_reward(
+        prompt="case", completion=comp_stuffed, ground_truth=gt,
+        differential_candidates=candidates, distractor_buts=buts,
+    )
+    # Distractor name was never mentioned, so proximity attribution rejects it
+    assert score == 2.0  # Gold credit only
+
+
+def test_amboss_adversarial_asymmetric_substring_gold_rejection():
+    """Verify that answering with a generic subword ('Acute') does NOT match multi-word gold ('Acute cholecystitis')."""
+    reward_fn = AmbossDifferentialReward()
+    gt = "Acute cholecystitis"
+
+    comp_generic = "<think>High suspicion of acute condition.</think><answer>Acute</answer>"
+    score_generic = reward_fn.compute_reward(prompt="case", completion=comp_generic, ground_truth=gt)
+    assert score_generic == 0.0  # Must NOT match gold
+
+    comp_inverted = "<think>High suspicion.</think><answer>Cholecystitis</answer>"
+    score_inverted = reward_fn.compute_reward(prompt="case", completion=comp_inverted, ground_truth=gt)
+    assert score_inverted == 0.0  # Partial single-word does NOT match compound gold
+
+
+def test_amboss_adversarial_rule_out_without_gold_magnitude_dominance():
+    """Verify that articulate-but-wrong reasoning with 4 valid rule-outs scores strictly <= 0.80,
+    guaranteeing strict mathematical dominance over any gold-correct answer (>= 2.00).
+    """
+    reward_fn = AmbossDifferentialReward(
+        gold_reward=2.0,
+        ruleout_credit_per_candidate=0.20,
+        max_ruleout_credit=0.80,
+        gate_on_gold=False,
+    )
+    gt = "Streptococcus pneumoniae"
+    candidates = [
+        "Salmonella paratyphi",
+        "Nontypeable Haemophilus influenzae",
+        "Neisseria meningitidis",
+        "Staphylococcus aureus",
+    ]
+    buts = {
+        "Salmonella paratyphi": "osteomyelitis risk in bone crisis",
+        "Nontypeable Haemophilus influenzae": "unencapsulated otitis media pathogen",
+        "Neisseria meningitidis": "petechial purpuric rash presentation",
+        "Staphylococcus aureus": "cavitary abscess formation on chest radiograph",
+    }
+
+    # Wrong answer given ("Mycoplasma"), but all 4 distractors correctly analyzed in <rule_out> blocks
+    comp_articulate_wrong = (
+        "<think>"
+        '<rule_out target="Salmonella paratyphi">osteomyelitis risk in bone crisis is absent</rule_out>'
+        '<rule_out target="Nontypeable Haemophilus influenzae">unencapsulated otitis media pathogen is not seen</rule_out>'
+        '<rule_out target="Neisseria meningitidis">petechial purpuric rash presentation not present</rule_out>'
+        '<rule_out target="Staphylococcus aureus">cavitary abscess formation on chest radiograph absent</rule_out>'
+        "</think>"
+        "<answer>Mycoplasma pneumoniae</answer>"
+    )
+
+    score_wrong = reward_fn.compute_reward(
+        prompt="case", completion=comp_articulate_wrong, ground_truth=gt,
+        differential_candidates=candidates, distractor_buts=buts,
+    )
+    assert score_wrong == 0.80  # Exactly max ruleout credit
+
+    # Correct answer with ZERO ruleouts
+    comp_correct_bare = "<answer>Streptococcus pneumoniae</answer>"
+    score_correct = reward_fn.compute_reward(
+        prompt="case", completion=comp_correct_bare, ground_truth=gt,
+        differential_candidates=candidates, distractor_buts=buts,
+    )
+    assert score_correct == 2.00
+
+    # Strict magnitude dominance invariant: wrong answer max <= 0.80 < 2.00 <= right answer min
+    assert score_wrong <= 0.80
+    assert score_correct >= 2.00
+    assert score_correct > score_wrong
+    assert (score_correct - score_wrong) >= 1.20  # Minimum 1.20 gap guarantees no score inversion
+
+
