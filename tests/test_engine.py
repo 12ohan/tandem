@@ -58,3 +58,47 @@ def test_sampler_residual():
     
     sampled = sample_residual(target, draft)
     assert sampled.item() in (2,)  # only index 2 has target > draft (0.4 > 0.2)
+
+
+def test_sampler_residual_canary_distribution():
+    """Verify Leviathan canary: q = [0.9, 0.1], p = [0.1, 0.9].
+    
+    Residual r(y) = max(0, p(y) - q(y)) / sum(...) must evaluate to [0.0, 1.0].
+    Simulated speculative acceptance-rejection must recover p = [0.1, 0.9].
+    """
+    p = torch.tensor([[0.1, 0.9]], dtype=torch.float32)
+    q = torch.tensor([[0.9, 0.1]], dtype=torch.float32)
+
+    # 1. Analytic residual check
+    residual = torch.clamp(p - q, min=0.0)
+    norm = torch.sum(residual, dim=-1, keepdim=True)
+    r = residual / norm
+    assert torch.allclose(r, torch.tensor([[0.0, 1.0]]), atol=1e-6)
+
+    # 2. End-to-end Monte Carlo simulation of speculative acceptance/rejection
+    torch.manual_seed(42)
+    num_samples = 20_000
+    p_flat = p[0]
+    q_flat = q[0]
+    
+    outputs = []
+    for _ in range(num_samples):
+        # Propose draft token from q
+        draft_tok = torch.multinomial(q_flat, num_samples=1).item()
+        
+        # Speculative acceptance probability: min(1.0, p(x) / q(x))
+        accept_prob = min(1.0, (p_flat[draft_tok] / q_flat[draft_tok]).item())
+        if torch.rand(1).item() < accept_prob:
+            outputs.append(draft_tok)
+        else:
+            # Rejection: sample from residual
+            res_tok = sample_residual(p, q).item()
+            outputs.append(res_tok)
+
+    counts = torch.bincount(torch.tensor(outputs), minlength=2).float()
+    empirical_p = counts / num_samples
+
+    # Must match p = [0.1, 0.9] within tight Monte Carlo bounds (3 sigma ~ 0.006)
+    assert abs(empirical_p[0].item() - 0.1) < 0.01
+    assert abs(empirical_p[1].item() - 0.9) < 0.01
+
