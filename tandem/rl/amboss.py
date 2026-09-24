@@ -40,6 +40,16 @@ SHORT_CLINICAL_ALLOWLIST: Set[str] = {
     "PH", "PO2", "PCO2", "BP", "O2", "HB",
 }
 
+# Clinical modifiers that may be dropped or added without changing the underlying diagnosis
+CLINICAL_MODIFIERS: Set[str] = {
+    "acute", "chronic", "severe", "mild", "moderate", "early", "late", "primary", "secondary",
+    "left", "right", "bilateral", "unilateral", "recurrent", "progressive", "stage", "type",
+    "grade", "suspected", "probable", "possible", "confirmed", "upper", "lower", "anterior",
+    "posterior", "superficial", "deep", "localized", "diffuse", "fulminant", "subacute",
+    "transient", "persistent",
+}
+
+
 # Generic clinical head nouns that cannot qualify as a diagnosis on their own
 GENERIC_CLINICAL_HEAD_NOUNS: Set[str] = {
     "syndrome", "syndromes", "disease", "diseases", "disorder", "disorders",
@@ -448,8 +458,19 @@ class AmbossDifferentialReward(BaseReward):
             if cand_tokens.issubset(GENERIC_CLINICAL_HEAD_NOUNS):
                 return False
 
-            if cand_tokens and cand_tokens.issubset(gt_tokens):
+            def _partial_ok(sub_tokens: Set[str], super_tokens: Set[str]) -> bool:
+                if not sub_tokens or not sub_tokens.issubset(super_tokens):
+                    return False
+                extra = super_tokens - sub_tokens
+                return not extra or extra.issubset(CLINICAL_MODIFIERS)
+
+            if cand_tokens and _partial_ok(cand_tokens, gt_tokens):
                 char_ratio = sum(len(t) for t in cand_tokens) / max(1, sum(len(t) for t in gt_tokens))
+                if char_ratio >= 0.50:
+                    return True
+
+            if gt_tokens and _partial_ok(gt_tokens, cand_tokens):
+                char_ratio = sum(len(t) for t in gt_tokens) / max(1, sum(len(t) for t in cand_tokens))
                 if char_ratio >= 0.50:
                     return True
 

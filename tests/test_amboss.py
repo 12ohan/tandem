@@ -863,3 +863,22 @@ def test_amboss_pneumococcus_synonym_known_gap():
     reward_fn = AmbossDifferentialReward()
     comp = "<think>Gram-positive diplococci.</think><answer>pneumococcus</answer>"
     assert reward_fn.compute_reward(prompt="case", completion=comp, ground_truth="Streptococcus pneumoniae") == 2.0
+
+
+def test_amboss_modifier_aware_partial_matching_controls():
+    """Verify clinical modifiers can be dropped/added, but non-modifier token changes reject."""
+    reward_fn = AmbossDifferentialReward()
+
+    # Modifier-only variation: accept both directions.
+    comp_partial = "<think>RUQ pain and Murphy sign.</think><answer>Cholecystitis</answer>"
+    assert reward_fn.compute_reward(prompt="case", completion=comp_partial, ground_truth="Acute cholecystitis") == 2.0
+
+    comp_full = "<think>RUQ pain and Murphy sign.</think><answer>Acute cholecystitis</answer>"
+    assert reward_fn.compute_reward(prompt="case", completion=comp_full, ground_truth="Cholecystitis") == 2.0
+
+    # Non-modifier differences: reject.
+    comp_vit_c = "<think>Vitamin deficiency.</think><answer>Vitamin C</answer>"
+    assert reward_fn.compute_reward(prompt="case", completion=comp_vit_c, ground_truth="Vitamin A") == 0.0
+
+    comp_chlor = "<think>Hypertension regimen.</think><answer>Chlorthalidone</answer>"
+    assert reward_fn.compute_reward(prompt="case", completion=comp_chlor, ground_truth="Lisinopril and chlorthalidone") == 0.0
