@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tandem"
+version = "0.1.0"
+description = "Ultra-fast self-speculative inference and DiffuGRPO engine for Nemotron-Labs-Diffusion on Apple Silicon"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [
+    { name = "Rohan Master", email = "12ohan@users.noreply.github.com" }
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: MacOS",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.2.0",
+    "transformers>=4.40.0",
+    "numpy>=1.24.0",
+]
+
+[project.optional-dependencies]
+mlx = [
+    "mlx>=0.15.0",
+    "mlx-lm>=0.18.0",
+]
+dev = [
+    "pytest>=7.0.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["tandem*"]
