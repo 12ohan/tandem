@@ -243,7 +243,19 @@ def test_amboss_differential_reward_matching_ruleouts_failing_gold():
         "<think>Rule out prostate cancer because incidence is decreased in this syndrome.</think>"
         "<answer>Aortic dissection</answer>"
     )
-    score_ro1 = reward_fn.compute_reward(
+    # With default gate_on_gold=True: articulate wrong diagnosis gets 0.0 (exploit blocked)
+    score_gated = reward_fn.compute_reward(
+        prompt="prompt",
+        completion=comp_ro1,
+        ground_truth=gt,
+        differential_candidates=candidates,
+        distractor_buts=buts,
+    )
+    assert score_gated == 0.0, "Rule-out credit must be gated on gold diagnosis match"
+
+    # With gate_on_gold=False explicitly enabled: awards partial credit
+    ungated_reward = AmbossDifferentialReward(gate_on_gold=False)
+    score_ro1 = ungated_reward.compute_reward(
         prompt="prompt",
         completion=comp_ro1,
         ground_truth=gt,
@@ -252,7 +264,7 @@ def test_amboss_differential_reward_matching_ruleouts_failing_gold():
     )
     assert score_ro1 == 0.25
 
-    # 2 rule-outs matched, gold failed
+    # 2 rule-outs matched, gold failed, ungated
     comp_ro2 = (
         "<think>"
         "Rule out prostate cancer due to decreased incidence. "
@@ -260,7 +272,7 @@ def test_amboss_differential_reward_matching_ruleouts_failing_gold():
         "</think>"
         "<answer>Leukemia</answer>"
     )
-    score_ro2 = reward_fn.compute_reward(
+    score_ro2 = ungated_reward.compute_reward(
         prompt="prompt",
         completion=comp_ro2,
         ground_truth=gt,
@@ -395,3 +407,84 @@ def test_amboss_differential_reward_with_real_question():
         **item.metadata,
     )
     assert fail_score == 0.0
+
+
+def test_amboss_differential_tag_recall():
+    """Verify that gold diagnosis present in <differential> candidate block scores 1.0 even without <answer> tag."""
+    reward_fn = AmbossDifferentialReward()
+    gt = "Streptococcus pneumoniae"
+
+    comp = (
+        "<think>Considering acute pulmonary infection in SCD.</think>"
+        "<differential>"
+        "<candidate>Streptococcus pneumoniae</candidate>"
+        "<candidate>Salmonella paratyphi</candidate>"
+        "</differential>"
+    )
+    score = reward_fn.compute_reward(
+        prompt="prompt",
+        completion=comp,
+        ground_truth=gt,
+    )
+    assert score == 1.0
+
+
+def test_amboss_negation_scope_check():
+    """Verify that when a distractor rationale relies on absent findings ('no lymphadenopathy'),
+    affirming presence ('shows prominent lymphadenopathy') invalidates the rule-out credit.
+    """
+    reward_fn = AmbossDifferentialReward(gate_on_gold=False)
+    gt = "Klebsiella granulomatis"
+    candidates = ["Treponema pallidum"]
+    buts = {"Treponema pallidum": "causes painless chancre with prominent inguinal lymphadenopathy, whereas patient has no lymphadenopathy"}
+
+    # Case A: Correctly recognizing absence -> credit awarded
+    comp_correct = (
+        "<think>Treponema pallidum is ruled out because patient has no lymphadenopathy.</think>"
+        "<answer>Klebsiella granulomatis</answer>"
+    )
+    score_correct = reward_fn.compute_reward(
+        prompt="prompt",
+        completion=comp_correct,
+        ground_truth=gt,
+        differential_candidates=candidates,
+        distractor_buts=buts,
+    )
+    assert score_correct == 1.25
+
+    # Case B: False affirmation ("severe lymphadenopathy present") -> negation violated, credit rejected
+    comp_affirmed = (
+        "<think>Treponema pallidum because examination shows prominent lymphadenopathy.</think>"
+        "<answer>Klebsiella granulomatis</answer>"
+    )
+    score_affirmed = reward_fn.compute_reward(
+        prompt="prompt",
+        completion=comp_affirmed,
+        ground_truth=gt,
+        differential_candidates=candidates,
+        distractor_buts=buts,
+    )
+    assert score_affirmed == 1.0  # Only gold credit, rule-out rejected due to negation violation
+
+
+def test_amboss_proximity_attribution():
+    """Verify that keyword stuffing 100 words away from the distractor candidate does not trigger rule-out credit."""
+    reward_fn = AmbossDifferentialReward(gate_on_gold=False)
+    gt = "Breast cancer"
+    candidates = ["Prostate cancer"]
+    buts = {"Prostate cancer": "decreased incidence"}
+
+    # Distractor name mentioned at start, keyword dumped at end >50 words away
+    filler = " " + "word " * 60
+    comp_stuffed = (
+        f"<think>Prostate cancer was considered.{filler}However decreased incidence occurs elsewhere.</think>"
+        "<answer>Breast cancer</answer>"
+    )
+    score_stuffed = reward_fn.compute_reward(
+        prompt="prompt",
+        completion=comp_stuffed,
+        ground_truth=gt,
+        differential_candidates=candidates,
+        distractor_buts=buts,
+    )
+    assert score_stuffed == 1.0  # Gold awarded, distractor rule-out rejected due to proximity window breach

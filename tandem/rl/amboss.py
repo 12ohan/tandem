@@ -231,16 +231,22 @@ def load_amboss_questions(
 
 
 class AmbossDifferentialReward(BaseReward):
-    """Clinical differential scoring reward.
+    """Hardened clinical differential scoring reward.
 
-    Scoring logic:
-    1. Gold diagnosis correctness (+1.0):
-       Checks if the gold diagnosis/answer is in the predicted completion/differential
-       (prioritizing <answer>...</answer> tags if present).
-    2. Differential rule-out partial credit (+0.25 to +0.5 per distractor / up to +1.0 total):
-       Rewards discussing candidate differential diagnoses from metadata['differential_candidates']
-       and matching rule-out keywords / rationales from metadata['distractor_buts'].
-    3. Scores are bounded cleanly between 0.0 and 2.0.
+    Scoring logic & exploit protections:
+    1. Candidate Differential & Gold Correctness (+1.0):
+       - Recognizes gold diagnosis in <answer> tags OR within a <differential> candidate block.
+       - Supports option letter matching when options are present.
+    2. Gated Rule-Out Credit (+0.25 per verified distractor, max +1.0):
+       - Gating: If gold is not in the differential or answer, rule-out credit is strictly gated
+         (prevents "articulate-but-wrong" keyword harvesting).
+       - Structured/Window Attribution: Rationale keywords must appear within proximity
+         (+/- 25 words) of the specific candidate distractor, or within a <rule_out target="..."> block.
+       - Negation Scope Check: If distractor rationale relies on absent findings (e.g. "no lymphadenopathy"),
+         affirmative statements ("prominent lymphadenopathy", "severe lymphadenopathy") are invalidated.
+    3. Discrete Bounding:
+       - 1.0 for gold + 0.25 * n_verified_distractors (up to 4) = max 2.0.
+       - The 2.0 ceiling is only reachable by a complete, correct differential.
     """
 
     def __init__(
@@ -249,12 +255,19 @@ class AmbossDifferentialReward(BaseReward):
         ruleout_credit_per_candidate: float = 0.25,
         max_ruleout_credit: float = 1.0,
         min_keyword_length: int = 4,
+        gate_on_gold: bool = True,
+        proximity_word_window: int = 25,
     ):
         self.gold_reward = gold_reward
         self.ruleout_credit_per_candidate = ruleout_credit_per_candidate
         self.max_ruleout_credit = max_ruleout_credit
         self.min_keyword_length = min_keyword_length
+        self.gate_on_gold = gate_on_gold
+        self.proximity_word_window = proximity_word_window
+
         self.xml_answer_pattern = re.compile(r"<answer>(.*?)</answer>", re.DOTALL | re.IGNORECASE)
+        self.xml_diff_pattern = re.compile(r"<differential>(.*?)</differential>", re.DOTALL | re.IGNORECASE)
+        self.xml_ruleout_pattern = re.compile(r"<rule_out\s+target=[\"'](.*?)[\"']>(.*?)</rule_out>", re.DOTALL | re.IGNORECASE)
 
     def extract_answer(self, text: str) -> Optional[str]:
         """Extract answer string from <answer> tags if present."""
@@ -263,15 +276,23 @@ class AmbossDifferentialReward(BaseReward):
             return matches[-1].strip()
         return None
 
+    def extract_differential(self, text: str) -> Optional[str]:
+        """Extract differential content from <differential> tags if present."""
+        matches = self.xml_diff_pattern.findall(text)
+        if matches:
+            return " ".join(matches).strip()
+        return None
+
     def _match_gold(
         self,
         completion: str,
         ground_truth: str,
         options: Optional[List[Dict[str, Any]]] = None,
     ) -> bool:
-        """Determine whether the gold diagnosis matches the completion."""
+        """Determine whether the gold diagnosis matches the answer or differential."""
         norm_gt = _normalize_text(ground_truth)
-        extracted = self.extract_answer(completion)
+        if not norm_gt:
+            return False
 
         # Check gold option letter if available
         gold_letter = ""
@@ -281,23 +302,50 @@ class AmbossDifferentialReward(BaseReward):
                     gold_letter = str(opt.get("letter", "")).strip().lower()
                     break
 
+        # 1. Check <answer> tag
+        extracted = self.extract_answer(completion)
         if extracted is not None:
             norm_ext = _normalize_text(extracted)
-            if not norm_ext:
-                return False
-            # 1. Direct substring match with ground truth
-            if norm_gt in norm_ext or (len(norm_ext) >= 4 and norm_ext in norm_gt):
-                return True
-            # 2. Check if extracted matches the gold letter (e.g. "b" or "option b")
-            if gold_letter:
-                tokens = set(norm_ext.split())
-                if gold_letter in tokens or norm_ext == gold_letter:
+            if norm_ext:
+                if norm_gt in norm_ext or (len(norm_ext) >= 4 and norm_ext in norm_gt):
                     return True
-            return False
+                if gold_letter:
+                    tokens = set(norm_ext.split())
+                    if gold_letter in tokens or norm_ext == gold_letter:
+                        return True
 
-        # If no <answer> tag is present, check the completion / differential text
+        # 2. Check <differential> tag (candidate set recall)
+        diff_text = self.extract_differential(completion)
+        if diff_text is not None:
+            norm_diff = _normalize_text(diff_text)
+            if norm_gt in norm_diff:
+                return True
+            if gold_letter:
+                diff_tokens = set(norm_diff.split())
+                if gold_letter in diff_tokens:
+                    return True
+
+        # 3. Fallback: check completion text directly
         norm_comp = _normalize_text(completion)
         return norm_gt in norm_comp
+
+    def _is_negation_violated(self, rationale: str, context_text: str, keyword: str) -> bool:
+        """Check if rationale specifies an absence but context affirms presence."""
+        rat_lower = rationale.lower()
+        neg_indicators = ["no ", "without ", "lacks ", "absent ", "absence of ", "negative "]
+        is_negated_rationale = any(ind in rat_lower for ind in neg_indicators)
+        if not is_negated_rationale:
+            return False
+
+        # If rationale states absence, check if context used affirmative modifiers directly before keyword
+        ctx_lower = context_text.lower()
+        kw_idx = ctx_lower.find(keyword)
+        if kw_idx > 0:
+            prefix = ctx_lower[max(0, kw_idx - 35) : kw_idx]
+            affirm_words = ["prominent", "marked", "severe", "present", "presence of", "shows", "confirmed", "diffuse"]
+            if any(aw in prefix for aw in affirm_words):
+                return True
+        return False
 
     def compute_reward(
         self,
@@ -306,7 +354,7 @@ class AmbossDifferentialReward(BaseReward):
         token_ids: Optional[List[int]] = None,
         **kwargs,
     ) -> float:
-        """Compute scalar clinical differential reward for a prompt-completion pair."""
+        """Compute hardened scalar clinical differential reward."""
         ground_truth = kwargs.get("ground_truth") or kwargs.get("target") or kwargs.get("gold_answer")
         differential_candidates = kwargs.get("differential_candidates") or []
         distractor_buts = kwargs.get("distractor_buts") or {}
@@ -317,7 +365,11 @@ class AmbossDifferentialReward(BaseReward):
         if ground_truth:
             gold_matched = self._match_gold(completion, str(ground_truth), options=options)
 
-        # 2. Candidate differential rule-out matching
+        # 2. Gating: If gold is not matched and gating is enabled, reject rule-out credit
+        if self.gate_on_gold and not gold_matched:
+            return 0.0
+
+        # 3. Parse candidate rule-outs
         items: List[Tuple[str, Any]] = []
         if isinstance(distractor_buts, dict):
             items = list(distractor_buts.items())
@@ -329,17 +381,21 @@ class AmbossDifferentialReward(BaseReward):
         elif isinstance(distractor_buts, str):
             items = [("", distractor_buts)]
 
-        # Extract differential reasoning text (preferring <think> tags, or excluding <answer> tags)
+        # Extract reasoning text (preferring <think> tags, or full completion)
         xml_think_matches = re.findall(r"<think>(.*?)</think>", completion, re.DOTALL | re.IGNORECASE)
         if xml_think_matches:
             reasoning_text = " ".join(xml_think_matches)
         else:
             reasoning_text = re.sub(r"(?is)<answer>.*?</answer>", " ", completion)
 
+        reasoning_words = re.findall(r"[a-zA-Z0-9_\-]+", reasoning_text.lower())
         reasoning_lower = reasoning_text.lower()
-        reasoning_norm = _normalize_text(reasoning_text)
 
-        # Also get extracted answer to ensure chosen candidate is not counted as ruled-out
+        # Parse any explicit <rule_out target="..."> blocks
+        explicit_ruleouts = {}
+        for target, content in self.xml_ruleout_pattern.findall(completion):
+            explicit_ruleouts[_normalize_text(target)] = content.lower()
+
         extracted_answer = self.extract_answer(completion)
         extracted_norm = _normalize_text(extracted_answer) if extracted_answer else ""
 
@@ -350,23 +406,11 @@ class AmbossDifferentialReward(BaseReward):
             cand_norm = _normalize_text(cand_str)
             cand_words = set(re.findall(r"[a-zA-Z0-9_\-]+", cand_str.lower()))
 
-            # If candidate was explicitly chosen as the final answer, it is not ruled out
+            # If candidate was explicitly chosen as the final answer, it cannot be ruled out
             if extracted_norm and cand_norm and (cand_norm in extracted_norm or extracted_norm in cand_norm):
                 continue
 
-            # Check candidate presence in differential reasoning text
-            cand_present = False
-            if cand_str:
-                if cand_norm in reasoning_norm:
-                    cand_present = True
-                else:
-                    sig_words = [w for w in cand_words if len(w) >= 4 and w not in STOP_WORDS]
-                    if sig_words and any(w in reasoning_lower for w in sig_words):
-                        cand_present = True
-            else:
-                cand_present = True
-
-            # Extract keywords from the rule-out rationale
+            # Extract discriminative keywords from the rationale
             if isinstance(rationale, (list, set, tuple)):
                 kws = {
                     str(k).lower().strip()
@@ -380,17 +424,43 @@ class AmbossDifferentialReward(BaseReward):
                     min_len=self.min_keyword_length,
                 )
 
-            matched_kws = {kw for kw in kws if kw in reasoning_lower}
+            if not kws:
+                continue
 
-            # Candidate rule-out matches if:
-            # - Candidate is mentioned in reasoning and at least 1 rule-out keyword matches, OR
-            # - At least 2 specific rule-out keywords match in reasoning, OR
-            # - Rationale is very short (1 keyword) and matches
-            if cand_present and len(matched_kws) >= 1:
-                matched_ruleouts += 1
-            elif len(matched_kws) >= 2:
-                matched_ruleouts += 1
-            elif len(kws) == 1 and len(matched_kws) >= 1:
+            # A. Check explicit <rule_out target="..."> block if present
+            distractor_verified = False
+            for target_norm, block_content in explicit_ruleouts.items():
+                if cand_norm in target_norm or target_norm in cand_norm:
+                    matching_in_block = [kw for kw in kws if kw in block_content]
+                    if matching_in_block:
+                        if not any(self._is_negation_violated(str(rationale), block_content, kw) for kw in matching_in_block):
+                            distractor_verified = True
+                            break
+
+            # B. Check proximity window around candidate mention in reasoning_text
+            if not distractor_verified and cand_str:
+                # Find all word positions where candidate is mentioned
+                cand_token = list(cand_words - STOP_WORDS)[0] if (cand_words - STOP_WORDS) else ""
+                if cand_token:
+                    mention_indices = [i for i, w in enumerate(reasoning_words) if w == cand_token]
+                    for idx in mention_indices:
+                        start_pos = max(0, idx - self.proximity_word_window)
+                        end_pos = min(len(reasoning_words), idx + self.proximity_word_window)
+                        window_text = " ".join(reasoning_words[start_pos:end_pos])
+                        matching_kws = [kw for kw in kws if kw in window_text]
+                        if matching_kws:
+                            if not any(self._is_negation_violated(str(rationale), window_text, kw) for kw in matching_kws):
+                                distractor_verified = True
+                                break
+
+            # C. Fallback: if candidate name is not in prompt metadata, require at least 2 keywords
+            if not distractor_verified and not cand_str:
+                matching_kws = [kw for kw in kws if kw in reasoning_lower]
+                if len(matching_kws) >= 2:
+                    if not any(self._is_negation_violated(str(rationale), reasoning_lower, kw) for kw in matching_kws):
+                        distractor_verified = True
+
+            if distractor_verified:
                 matched_ruleouts += 1
 
         ruleout_score = min(
