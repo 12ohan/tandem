@@ -80,20 +80,28 @@ tandem/
 - Setting `train_head_only=True` in `GRPOTrainerConfig` restricts autograd gradients strictly to these 402M parameters, allowing live RL training within Apple Silicon's 16 GB unified memory envelope.
 
 ### C. Reward Function Hardening (AmbossDifferentialReward)
-To prevent reinforcement learning reward hacking, the clinical reward function enforces four structural gates:
+To prevent reinforcement learning reward hacking, the clinical reward function enforces five structural gates:
 1. **Magnitude Dominance:** $Gold = 2.0$, $RuleOut = 0.20$ each (max 0.80 across 4 distractors). Total reward bounded in $[0.0, 2.80]$. Any wrong answer is strictly bounded below any right answer ($0.80 < 2.00$). Crucially, partial credit preserves within-group variance $\sigma_R > 0$ on all-wrong groups, preventing policy gradient stalls.
 2. **Candidate Set Recall:** Recognizes gold diagnosis in `<answer>` or in `<differential><candidate>...</candidate></differential>` tags.
 3. **No Think Block Overcrediting:** Mentioning a hypothesis in `<think>` that is later dropped for a wrong diagnosis scores 0.0. Asymmetric prefix matching (e.g. "acute" matching "acute cholecystitis") is eliminated.
-4. **Proximity Window & Negation Scope:** Distractor keywords must appear within $\pm 25$ words of the candidate's mention or inside `<rule_out target="...">`. If a rationale specifies absent findings ("no lymphadenopathy"), affirmative statements ("prominent lymphadenopathy") invalidate the rule-out credit.
+4. **Proximity Window & Regex Negation Guard:** Distractor keywords must appear within $\pm 25$ words of the candidate's mention or inside `<rule_out target="...">`. Negation scope uses word boundaries (e.g. `\bpresent\b`) and expanded affirmative verbs (`shows`, `reveals`, `demonstrates`, `notable`) scanning all keyword occurrences across the context.
+5. **Deterministic Held-Out Splitting:** `load_amboss_questions(directory_path, split="all"|"train"|"eval", eval_split_ratio=0.15)` uses deterministic SHA-256 hash on question ID to guarantee zero train/eval leakage.
 
-### D. Semantic Candidate Differential Scorer (KV-Cache Reuse & Length Normalization)
+### D. Semantic Candidate Differential Scorer (KV-Cache Reuse, Contrastive PMI)
 - **$O(1)$ Prompt Recomputation:** Given a clinical vignette of length $P$, prefill the KV cache once. For each candidate of length $M$, execute forward pass of length $M-1$, evaluate per-token logprobs, and call `kv_cache.crop(P)`.
-- **Length Normalization:** Ranks candidates by $\bar{\ell} = \frac{1}{M}\sum_{i=1}^M \log p(y_i \mid x, y_{<i})$. Eliminates length bias against detailed medical terms.
-- **Diagnostic Entropy:** Computes categorical softmax distribution $p_k = \frac{\exp(\bar{\ell}_k/\tau)}{\sum \exp(\bar{\ell}_j/\tau)}$ and Shannon entropy $H = -\sum p_k \log_2(p_k)$ in bits, directly measuring clinical uncertainty.
+- **Prefix Stability Assertion:** Validates that `full_toks[:P] == ctx_tokens` at BPE boundaries; cleanly falls back to continuation tokenization if a boundary merge occurs.
+- **Contrastive Pointwise Mutual Information (PMI):** Option to evaluate candidates against a neutral context ($x_{\text{neutral}}$):
+  $$\text{PMI}(y; x) = \log p(y \mid x) - \log p(y \mid x_{\text{neutral}})$$
+  Subtracting generic term frequency cancels out baseline prior bias, prioritizing diagnoses specifically indicated by findings in the vignette.
+- **Diagnostic Entropy:** Computes categorical softmax distribution across candidates and Shannon entropy $H = -\sum p_k \log_2(p_k)$ in bits, directly measuring clinical uncertainty.
 
-### E. Hint-in-Prompt Curriculum for Homogeneous Groups
-- When all $G=4$ rollouts fail on hard clinical cases ($R_i = 0 \implies \sigma_R = 0$), the trainer conditions the prompt with clinical guidance from metadata (`learning_objective` or gold rationale) and re-rolls.
-- Because the hint is injected into the *prompt* (the condition $x$) rather than the *completion*, the generated rollouts $y \sim \pi_\theta(\cdot \mid x_{\text{hint}})$ remain 100% on-policy. The importance sampling ratio $r_t = 1.0$ is preserved exactly without off-policy divergence.
+### E. Hint-in-Prompt Curriculum & Dead-Group Semantics
+- **Answer-Leak Guard:** Multi-source screening across `learning_objective`, `hint`, `gold_why`, and `distractor_buts`. Performs sentence-level filtering and aggressive token-level masking (`[CONDITION]` and `[...]`) ensuring the gold diagnosis is never leaked. Falls back gracefully if fewer than 2 clinical reasoning tokens remain.
+- **Split Dead-Group Semantics:**
+  - All-failed groups ($R_i < 2.0$, spread $< 10^{-5}$): Triggers screened curriculum hint re-roll.
+  - All-correct groups ($R_i \ge 2.0$): Bypasses rescue cleanly without wasting compute re-rolling solved cases.
+  - All-truncated rollouts: If rollouts exhaust `max_new_tokens` without EOS, hint rescue is skipped.
+- **DAPO Advantage Bypass:** If all group advantages are zero, `compute_rollout_loss` shortcuts immediately without building causal autograd graphs, saving significant GPU FLOPs and memory.
 
 ---
 
@@ -112,12 +120,12 @@ To prevent reinforcement learning reward hacking, the clinical reward function e
 
 ## 6. Verification Receipts & Test Commands
 
-### Fast Unit Test Suite (71 Tests, 7.8s)
+### Fast Unit Test Suite (75 Tests, 8.4s)
 ```bash
 cd /Users/rohanmaster/Developer/tandem
 PYTHONPATH=. pytest -m "not integration and not slow" tests/
 ```
-Result: `71 passed, 2 deselected, 1 warning in 7.87s`.
+Result: `75 passed, 2 deselected, 1 warning in 8.42s`.
 
 ### Real-Weights Amboss GRPO Step (Single-Process MPS)
 ```bash
@@ -135,7 +143,7 @@ Receipt: All per-token logprobs finite in $[-20.0, 0.0]$, zero NaNs, mean logpro
 ```bash
 PYTHONPATH=. pytest -s -k "test_candidate_scorer_real_weights_amboss" tests/test_candidate_scorer.py
 ```
-Receipt: Evaluates 4 Amboss options in 22s; ranks gold diagnosis #1 (`Salmonella paratyphi`, mean logp -0.4175, prob 47.62%); entropy 1.585 bits.
+Receipt: Evaluates 5 Amboss options (`all_candidates`) in 22s; ranks gold diagnosis (*Streptococcus pneumoniae*) vs distractors; verified with strict precondition assertions (`item.ground_truth in candidates`).
 
 ---
 
