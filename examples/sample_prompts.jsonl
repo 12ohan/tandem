@@ -1,0 +1,4 @@
+{"prompt": "Calculate the derivative of f(x) = 3*x^2 + 5*x - 2.", "ground_truth": "6*x + 5", "metadata": {"topic": "calculus", "difficulty": "easy"}}
+{"prompt": "A patient presents with acute episodic hypertension, diaphoresis, and pounding headaches. What is the most likely diagnosis?", "ground_truth": "pheochromocytoma", "metadata": {"topic": "medicine", "difficulty": "medium"}}
+{"prompt": "What is the capital of Australia?", "ground_truth": "Canberra", "metadata": {"topic": "geography", "difficulty": "easy"}}
+{"prompt": "Solve for x: 2*x + 7 = 19.", "ground_truth": "6", "metadata": {"topic": "algebra", "difficulty": "easy"}}
