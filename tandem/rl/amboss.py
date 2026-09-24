@@ -245,17 +245,19 @@ class AmbossDifferentialReward(BaseReward):
        - Negation Scope Check: If distractor rationale relies on absent findings (e.g. "no lymphadenopathy"),
          affirmative statements ("prominent lymphadenopathy", "severe lymphadenopathy") are invalidated.
     3. Discrete Bounding:
-       - 1.0 for gold + 0.25 * n_verified_distractors (up to 4) = max 2.0.
-       - The 2.0 ceiling is only reachable by a complete, correct differential.
+       - 2.0 for gold + 0.20 * n_verified_distractors (up to 4) = max 2.80.
+       - The 2.80 ceiling is only reachable by a complete, correct differential.
+       - Under magnitude dominance (gate_on_gold=False default), any wrong answer
+         scores at most 0.80, strictly dominated by any correct answer (2.00).
     """
 
     def __init__(
         self,
-        gold_reward: float = 1.0,
-        ruleout_credit_per_candidate: float = 0.25,
-        max_ruleout_credit: float = 1.0,
-        min_keyword_length: int = 4,
-        gate_on_gold: bool = True,
+        gold_reward: float = 2.0,
+        ruleout_credit_per_candidate: float = 0.20,
+        max_ruleout_credit: float = 0.80,
+        min_keyword_length: int = 3,
+        gate_on_gold: bool = False,
         proximity_word_window: int = 25,
     ):
         self.gold_reward = gold_reward
@@ -289,12 +291,20 @@ class AmbossDifferentialReward(BaseReward):
         ground_truth: str,
         options: Optional[List[Dict[str, Any]]] = None,
     ) -> bool:
-        """Determine whether the gold diagnosis matches the answer or differential."""
+        """Determine whether the gold diagnosis matches the answer or differential.
+
+        Strict matching rules:
+        1. Primary check: gold option letter (e.g. 'b' or '(b)' or 'option b') in <answer>.
+        2. Diagnosis string match: full normalized ground truth contained in extracted <answer>.
+        3. Differential tag recall: full normalized ground truth in <differential>.
+        4. NO fallback to full completion/think text (prevents rewarding dropped hypotheses).
+        5. NO asymmetric prefix matching (prevents 'acute' matching 'acute cholecystitis').
+        """
         norm_gt = _normalize_text(ground_truth)
         if not norm_gt:
             return False
 
-        # Check gold option letter if available
+        # Extract gold option letter if available
         gold_letter = ""
         if options:
             for opt in options:
@@ -306,28 +316,38 @@ class AmbossDifferentialReward(BaseReward):
         extracted = self.extract_answer(completion)
         if extracted is not None:
             norm_ext = _normalize_text(extracted)
-            if norm_ext:
-                if norm_gt in norm_ext or (len(norm_ext) >= 4 and norm_ext in norm_gt):
+            ext_lower = extracted.lower().strip()
+
+            # Primary: Check option letter matching in <answer>
+            if gold_letter:
+                tokens = set(re.findall(r"[a-zA-Z0-9]+", ext_lower))
+                if gold_letter in tokens or norm_ext == gold_letter:
                     return True
-                if gold_letter:
-                    tokens = set(norm_ext.split())
-                    if gold_letter in tokens or norm_ext == gold_letter:
-                        return True
+                # Match '(b)' or 'b.' or 'option b'
+                if f"({gold_letter})" in ext_lower or f"option {gold_letter}" in ext_lower:
+                    return True
+
+            # Secondary: Exact or full-containment match with ground truth
+            # NOTE: Only norm_gt in norm_ext (extracted answer contains gold), NEVER norm_ext in norm_gt
+            if norm_gt and norm_gt in norm_ext:
+                return True
 
         # 2. Check <differential> tag (candidate set recall)
         diff_text = self.extract_differential(completion)
         if diff_text is not None:
             norm_diff = _normalize_text(diff_text)
-            if norm_gt in norm_diff:
+            diff_lower = diff_text.lower()
+            if norm_gt and norm_gt in norm_diff:
                 return True
             if gold_letter:
-                diff_tokens = set(norm_diff.split())
+                diff_tokens = set(re.findall(r"[a-zA-Z0-9]+", diff_lower))
                 if gold_letter in diff_tokens:
                     return True
 
-        # 3. Fallback: check completion text directly
-        norm_comp = _normalize_text(completion)
-        return norm_gt in norm_comp
+        # STRICT: No fallback to general completion/<think> text.
+        # If the model merely considered the diagnosis in <think> without confirming
+        # it in <answer> or listing it in <differential>, gold is NOT matched.
+        return False
 
     def _is_negation_violated(self, rationale: str, context_text: str, keyword: str) -> bool:
         """Check if rationale specifies an absence but context affirms presence."""
@@ -439,10 +459,9 @@ class AmbossDifferentialReward(BaseReward):
 
             # B. Check proximity window around candidate mention in reasoning_text
             if not distractor_verified and cand_str:
-                # Find all word positions where candidate is mentioned
-                cand_token = list(cand_words - STOP_WORDS)[0] if (cand_words - STOP_WORDS) else ""
-                if cand_token:
-                    mention_indices = [i for i, w in enumerate(reasoning_words) if w == cand_token]
+                cand_tokens = [w for w in cand_words if w not in STOP_WORDS and len(w) >= 3]
+                if cand_tokens:
+                    mention_indices = [i for i, w in enumerate(reasoning_words) if w in cand_tokens]
                     for idx in mention_indices:
                         start_pos = max(0, idx - self.proximity_word_window)
                         end_pos = min(len(reasoning_words), idx + self.proximity_word_window)
@@ -469,4 +488,5 @@ class AmbossDifferentialReward(BaseReward):
         )
 
         total_reward = (self.gold_reward if gold_matched else 0.0) + ruleout_score
-        return max(0.0, min(2.0, float(total_reward)))
+        max_cap = self.gold_reward + self.max_ruleout_credit
+        return max(0.0, min(max_cap, float(total_reward)))

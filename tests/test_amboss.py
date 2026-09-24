@@ -174,7 +174,8 @@ def test_amboss_differential_reward_gold_only():
         differential_candidates=candidates,
         distractor_buts=buts,
     )
-    assert score == 1.0
+    # Under magnitude dominance: Gold alone = 2.0
+    assert score == 2.0
 
 
 def test_amboss_differential_reward_gold_plus_one_ruleout():
@@ -187,7 +188,7 @@ def test_amboss_differential_reward_gold_plus_one_ruleout():
     }
 
     completion = (
-        "<think>Rule out prostate cancer because incidence is decreased in Klinefelter syndrome.</think>"
+        "<think>Prostate cancer ruled out because incidence is decreased in Klinefelter syndrome.</think>"
         "<answer>Breast cancer</answer>"
     )
     score = reward_fn.compute_reward(
@@ -197,8 +198,8 @@ def test_amboss_differential_reward_gold_plus_one_ruleout():
         differential_candidates=candidates,
         distractor_buts=buts,
     )
-    # Gold (1.0) + 1 rule-out (0.25) = 1.25
-    assert score == 1.25
+    # Gold (2.0) + 1 rule-out (0.20) = 2.20
+    assert score == pytest.approx(2.20, abs=1e-5)
 
 
 def test_amboss_differential_reward_gold_plus_two_ruleouts():
@@ -225,11 +226,13 @@ def test_amboss_differential_reward_gold_plus_two_ruleouts():
         differential_candidates=candidates,
         distractor_buts=buts,
     )
-    # Gold (1.0) + 2 rule-outs (0.50) = 1.50
-    assert score == 1.50
+    # Gold (2.0) + 2 rule-outs (0.40) = 2.40
+    assert score == pytest.approx(2.40, abs=1e-5)
 
 
 def test_amboss_differential_reward_matching_ruleouts_failing_gold():
+    # Under magnitude dominance (default gate_on_gold=False):
+    # Rule-outs keep advantage variance alive without ever outscoring a right answer
     reward_fn = AmbossDifferentialReward()
     gt = "Breast cancer"
     candidates = ["Prostate cancer", "Aortic dissection"]
@@ -240,46 +243,44 @@ def test_amboss_differential_reward_matching_ruleouts_failing_gold():
 
     # 1 rule-out matched, gold failed
     comp_ro1 = (
-        "<think>Rule out prostate cancer because incidence is decreased in this syndrome.</think>"
+        "<think>Prostate cancer is ruled out because incidence is decreased in this syndrome.</think>"
         "<answer>Aortic dissection</answer>"
     )
-    # With default gate_on_gold=True: articulate wrong diagnosis gets 0.0 (exploit blocked)
-    score_gated = reward_fn.compute_reward(
+    score_ro1 = reward_fn.compute_reward(
         prompt="prompt",
         completion=comp_ro1,
         ground_truth=gt,
         differential_candidates=candidates,
         distractor_buts=buts,
     )
-    assert score_gated == 0.0, "Rule-out credit must be gated on gold diagnosis match"
+    # Partial credit = 0.20 (strictly < 2.00)
+    assert score_ro1 == pytest.approx(0.20, abs=1e-5)
 
-    # With gate_on_gold=False explicitly enabled: awards partial credit
-    ungated_reward = AmbossDifferentialReward(gate_on_gold=False)
-    score_ro1 = ungated_reward.compute_reward(
-        prompt="prompt",
-        completion=comp_ro1,
-        ground_truth=gt,
-        differential_candidates=candidates,
-        distractor_buts=buts,
-    )
-    assert score_ro1 == 0.25
-
-    # 2 rule-outs matched, gold failed, ungated
+    # 2 rule-outs matched, gold failed
     comp_ro2 = (
         "<think>"
-        "Rule out prostate cancer due to decreased incidence. "
-        "Rule out aortic dissection because connective tissue disorder of Marfan syndrome is absent."
+        "Prostate cancer ruled out due to decreased incidence. "
+        "Aortic dissection ruled out because connective tissue disorder of Marfan syndrome is absent."
         "</think>"
         "<answer>Leukemia</answer>"
     )
-    score_ro2 = ungated_reward.compute_reward(
+    score_ro2 = reward_fn.compute_reward(
         prompt="prompt",
         completion=comp_ro2,
         ground_truth=gt,
         differential_candidates=candidates,
         distractor_buts=buts,
     )
-    assert score_ro2 == 0.50
+    # 2 rule-outs = 0.40. MAGNITUDE DOMINANCE: 0.40 is far below min correct (2.00)
+    assert score_ro2 == pytest.approx(0.40, abs=1e-5)
+    assert score_ro2 < reward_fn.gold_reward
+
+    # With gate_on_gold=True explicitly set: gives 0.0
+    gated_reward = AmbossDifferentialReward(gate_on_gold=True)
+    assert gated_reward.compute_reward(
+        prompt="prompt", completion=comp_ro2, ground_truth=gt,
+        differential_candidates=candidates, distractor_buts=buts
+    ) == 0.0
 
 
 def test_amboss_differential_reward_failing_both():
@@ -329,9 +330,9 @@ def test_amboss_differential_reward_max_score_cap():
         differential_candidates=candidates,
         distractor_buts=buts,
     )
-    # Gold (1.0) + 4 rule-outs (4 * 0.25 = 1.0) = 2.0 (maximum)
-    assert score == 2.0
-    assert 0.0 <= score <= 2.0
+    # Gold (2.0) + 4 rule-outs (4 * 0.20 = 0.80) = 2.80 (never clipped prematurely)
+    assert score == pytest.approx(2.80, abs=1e-5)
+    assert score <= 3.0
 
 
 
@@ -350,7 +351,7 @@ def test_amboss_differential_reward_option_letter_matching():
         ground_truth="Breast cancer",
         options=options,
     )
-    assert score_letter == 1.0
+    assert score_letter == 2.0
 
     # Letter + content in answer tag
     comp_both = "<think>Reasoning...</think><answer>B. Breast cancer</answer>"
@@ -360,20 +361,42 @@ def test_amboss_differential_reward_option_letter_matching():
         ground_truth="Breast cancer",
         options=options,
     )
-    assert score_both == 1.0
+    assert score_both == 2.0
 
 
-def test_amboss_differential_reward_no_answer_tag_fallback():
+def test_amboss_differential_reward_dropped_hypothesis_not_scored():
+    """Verify that merely mentioning the gold diagnosis in <think> without confirming
+    it in <answer> or listing it in <differential> does NOT score gold credit.
+    """
     reward_fn = AmbossDifferentialReward()
     gt = "Breast cancer"
 
-    comp_untagged = "Clinical reasoning suggests the primary concern is breast cancer due to elevated estrogen."
+    # Mentioned in think as a rejected hypothesis, dropped for Leukemia in answer
+    comp_dropped = (
+        "<think>We must consider breast cancer, but patient presentation favors leukemia.</think>"
+        "<answer>Leukemia</answer>"
+    )
     score = reward_fn.compute_reward(
         prompt="prompt",
-        completion=comp_untagged,
+        completion=comp_dropped,
         ground_truth=gt,
     )
-    assert score == 1.0
+    assert score == 0.0, "Dropped hypothesis in <think> must not collect gold credit"
+
+
+def test_amboss_differential_reward_no_asymmetric_prefix_overcredit():
+    """Verify that an incomplete prefix like 'Acute' does NOT match 'Acute cholecystitis'."""
+    reward_fn = AmbossDifferentialReward()
+    gt = "Acute cholecystitis"
+
+    # Incomplete single-word prefix in <answer>
+    comp_prefix = "<think>Reasoning...</think><answer>Acute</answer>"
+    score = reward_fn.compute_reward(
+        prompt="prompt",
+        completion=comp_prefix,
+        ground_truth=gt,
+    )
+    assert score == 0.0, "Incomplete single-word prefix must not match multi-word disease"
 
 
 # =====================================================================
@@ -426,7 +449,7 @@ def test_amboss_differential_tag_recall():
         completion=comp,
         ground_truth=gt,
     )
-    assert score == 1.0
+    assert score == 2.0
 
 
 def test_amboss_negation_scope_check():
@@ -450,7 +473,8 @@ def test_amboss_negation_scope_check():
         differential_candidates=candidates,
         distractor_buts=buts,
     )
-    assert score_correct == 1.25
+    # Gold (2.0) + 1 rule-out (0.20) = 2.20
+    assert score_correct == pytest.approx(2.20, abs=1e-5)
 
     # Case B: False affirmation ("severe lymphadenopathy present") -> negation violated, credit rejected
     comp_affirmed = (
@@ -464,7 +488,7 @@ def test_amboss_negation_scope_check():
         differential_candidates=candidates,
         distractor_buts=buts,
     )
-    assert score_affirmed == 1.0  # Only gold credit, rule-out rejected due to negation violation
+    assert score_affirmed == 2.0  # Only gold credit (2.0), rule-out rejected due to negation violation
 
 
 def test_amboss_proximity_attribution():
@@ -487,4 +511,4 @@ def test_amboss_proximity_attribution():
         differential_candidates=candidates,
         distractor_buts=buts,
     )
-    assert score_stuffed == 1.0  # Gold awarded, distractor rule-out rejected due to proximity window breach
+    assert score_stuffed == 2.0  # Gold awarded (2.0), distractor rule-out rejected due to proximity window breach
