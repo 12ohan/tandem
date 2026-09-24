@@ -134,13 +134,15 @@ class DiffuGRPOTrainer:
                     rewards_list.append(float(score))
 
                 except RuntimeError as e:
-                    # §D: Catch mask_id commitment gracefully during policy drift
+                    # §D: Catch mask_id commitment gracefully during policy drift.
+                    # The failed rollout contributes its failure reward to group stats (lowering group mean
+                    # and raising valid siblings' advantages), but has zero completion tokens and zero
+                    # synthetic logprobs, completely excluding it from the policy gradient loss.
                     if "mask token" in str(e).lower():
                         failed_text = "<failed_mask_token_commitment>"
                         completions.append(failed_text)
                         acceptance_rates.append(0.0)
 
-                        # Encode prompt tokens for dummy failed trajectory
                         if hasattr(self.engine.runner, "tokenizer"):
                             prompt_toks = self.engine.runner.tokenizer.encode(
                                 prompt_item.prompt, add_special_tokens=False
@@ -148,15 +150,13 @@ class DiffuGRPOTrainer:
                         else:
                             prompt_toks = [1]
 
+                        # Empty completion trajectory: T = 0 tokens participate in loss
                         failed_col = TrajectoryCollector(
                             prompt_toks, temperature=self.config.temperature
                         )
-                        # Append the mask token with a large negative logprob
-                        mask_id = getattr(self.engine.runner, "mask_token_id", 131071)
-                        failed_col.append_step(token_id=mask_id, logprob=-20.0, entropy=0.0)
                         trajectories.append(failed_col.to_trajectory())
 
-                        # Assign format failure penalty
+                        # Assign format failure penalty for group advantage baseline
                         rewards_list.append(float(self.config.format_failure_reward))
                     else:
                         raise e
@@ -268,6 +268,31 @@ class DiffuGRPOTrainer:
         )
 
         return loss, metrics
+
+    def step_rollout(self, rollout: GRPORollout) -> Dict[str, float]:
+        """Perform a single RL optimization step directly on a precomputed rollout."""
+        self.engine.runner.model.train()
+        self.optimizer.zero_grad()
+
+        loss, metrics = self.compute_rollout_loss(rollout)
+        loss.backward()
+
+        if self.config.max_grad_norm > 0:
+            torch.nn.utils.clip_grad_norm_(self.trainable_params, self.config.max_grad_norm)
+
+        self.optimizer.step()
+
+        if torch.backends.mps.is_available() and self.config.empty_cache_interval > 0:
+            torch.mps.empty_cache()
+
+        return {
+            "loss": float(loss.item()),
+            "policy_loss": metrics.policy_loss,
+            "kl_loss": metrics.kl_loss,
+            "mean_reward": rollout.mean_reward,
+            "acceptance_rate": rollout.acceptance_rate,
+            "clip_fraction": metrics.clip_fraction,
+        }
 
     def step(self, batch: List[PromptItem]) -> Dict[str, float]:
         """Perform a single RL optimization step on a batch of prompts."""

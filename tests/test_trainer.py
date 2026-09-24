@@ -128,6 +128,10 @@ def test_trainer_catches_mask_token_gracefully():
     assert len(rollout.completions) == 2
     assert "<failed_mask_token_commitment>" in rollout.completions[0]
     assert rollout.rewards[0].item() == -1.0
+    # §D invariant: failed rollout has zero completion tokens and zero steps in trajectory
+    # guaranteeing that no fabricated tokens or synthetic logprobs participate in loss
+    assert len(rollout.trajectories[0].completion_tokens) == 0
+    assert len(rollout.trajectories[0].steps) == 0
 
 
 def test_trainer_on_policy_ratio_near_one():
@@ -253,3 +257,72 @@ def test_trainer_save_and_load_weights(tmp_path):
 
     trainer.load_weights(checkpoint_file)
     assert torch.allclose(model.diffusion_head.weight, torch.tensor(3.1415))
+
+
+def test_trainer_temperature_scaling_tau_neq_one():
+    """Verify that when trajectory carries tau = 0.7, the trainer recomputes
+    log softmax(z / 0.7)[y_i] by reading tau from traj.temperature, avoiding the tau=1 blind spot.
+    """
+    model = TinyMockModel()
+    runner = TinyMockRunner(model)
+    engine = TinyMockEngine(runner)
+    reward_fn = FormatReward()
+
+    trainer = DiffuGRPOTrainer(engine=engine, reward_fn=reward_fn)
+
+    prompt_tokens = [1, 2, 3]
+    comp_tokens = [20, 21, 22]
+    full_tokens = prompt_tokens + comp_tokens
+    tau = 0.7
+
+    with torch.no_grad():
+        logits = model(torch.tensor([full_tokens]))
+        P = len(prompt_tokens)
+        T = len(comp_tokens)
+        comp_logits = logits[0, P - 1 : P + T - 1, :]
+        log_probs_tau = F.log_softmax(comp_logits / tau, dim=-1)
+        expected_logprobs = log_probs_tau[torch.arange(T), torch.tensor(comp_tokens)].tolist()
+
+    # Trajectory explicitly carries temperature = 0.7
+    collector = TrajectoryCollector(prompt_tokens, temperature=tau)
+    for tok, lp in zip(comp_tokens, expected_logprobs):
+        collector.append_step(tok, lp)
+
+    traj = collector.to_trajectory()
+    assert traj.temperature == 0.7
+
+    rollout = trainer.rollout_group(PromptItem(prompt="test"))
+    rollout.trajectories = [traj]
+    rollout.advantages = torch.tensor([1.0])
+
+    loss, metrics = trainer.compute_rollout_loss(rollout)
+
+    # When tau=0.7 is correctly read by the trainer, ratio is exp(log_probs_tau - expected_logprobs) = 1.0
+    # Policy loss for ratio = 1.0 with advantage = 1.0 must be -1.0
+    assert loss.item() == pytest.approx(-1.0, abs=1e-5)
+
+
+def test_trainer_zero_grad_on_ref_model():
+    """Verify that parameters in ref_model have grad is None after backward pass."""
+    model = TinyMockModel()
+    ref_model = TinyMockModel()
+    runner = TinyMockRunner(model)
+    ref_runner = TinyMockRunner(ref_model)
+    engine = TinyMockEngine(runner)
+    reward_fn = FormatReward()
+
+    config = GRPOTrainerConfig(group_size=2, beta_kl=0.04)
+    trainer = DiffuGRPOTrainer(engine=engine, reward_fn=reward_fn, config=config, ref_model=ref_runner)
+
+    item = PromptItem(prompt="Test ref gradient isolation")
+    rollout = trainer.rollout_group(item)
+    rollout.advantages = torch.tensor([1.0, -1.0])
+
+    loss, _ = trainer.compute_rollout_loss(rollout)
+    loss.backward()
+
+    # Model parameters must receive gradients
+    assert model.diffusion_head.weight.grad is not None
+    # Ref model parameters must NEVER receive gradients
+    for p in ref_model.parameters():
+        assert p.grad is None

@@ -103,13 +103,17 @@ def run_teacher_forced_gate():
     print(f"Min  Ratio r_t:       {min_ratio:.5f}")
     print(f"Max  Ratio r_t:       {max_ratio:.5f}")
 
-    # 4. Strict assertions
-    # bf16 kernel reduction noise band between chunked verify and full batched forward:
-    # Empirical: mean |Delta| ~ 4.26e-2, max ~ 1.27e-1
-    assert mean_delta < 0.06, f"Mean delta {mean_delta} exceeds bf16 noise threshold 0.06"
-    assert max_delta < 0.15, f"Max delta {max_delta} exceeds bf16 noise threshold 0.15"
+    # 4. Strict assertions: Pinned Capstone Tolerance
+    # Regime Differences vs Greedy Parity (mean 4.18e-3):
+    # (i) tau=1.0 sampled tail tokens reach |logp| ~ 5.9, where bf16 relative precision on
+    #     large-magnitude logits produces larger absolute deltas (vs greedy near-argmax cancellation).
+    # (ii) Shape delta: L=5 chunked verify vs L=26 batched forward crosses Metal attention tile boundaries.
+    # Declared Operating Noise Floor: mean |Delta| < 0.05, max |Delta| < 0.15
+    assert mean_delta < 0.05, f"Mean delta {mean_delta} exceeds declared noise threshold 0.05"
+    assert max_delta < 0.15, f"Max delta {max_delta} exceeds declared noise threshold 0.15"
 
-    # On-policy ratios must center at 1.0 within bf16 noise and well inside PPO clip band [0.8, 1.2]
+    # On-policy ratios: Observed max deviation 9.5% provides 2x headroom vs PPO clip band 20%
+    # Guarantees that bf16 kernel reduction noise cannot trigger spurious policy clips.
     assert abs(mean_ratio - 1.0) < 0.02, f"Mean ratio {mean_ratio} diverges from 1.0"
     assert min_ratio > 0.8, f"Min ratio {min_ratio} clipped below 0.8"
     assert max_ratio < 1.2, f"Max ratio {max_ratio} clipped above 1.2"
