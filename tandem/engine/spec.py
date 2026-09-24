@@ -190,7 +190,12 @@ class TandemEngine:
 
             generated_ids.extend(accepted_tokens_slice)
 
+            # Invariant assertion: KV cache length must strictly equal
+            # prefix prompt tokens + all committed tokens minus the deferred next seed token
+            assert past_key_values.get_seq_length() == prompt_len + len(generated_ids) - 1
+
             # Check if any committed token hit an EOS token
+
             eos_hit = False
             for tok in accepted_tokens_slice:
                 if tok in eos_ids:
