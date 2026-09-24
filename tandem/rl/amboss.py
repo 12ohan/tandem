@@ -96,16 +96,20 @@ def _normalize_text(text: str) -> str:
     return s
 
 
-def _diagnosis_tokens(text: str) -> Set[str]:
-    """Tokenise a diagnosis, preserving clinical head nouns and expanding common abbreviations."""
+def _diagnosis_token_list(text: str) -> List[str]:
+    """Return ordered diagnosis tokens with possessive and abbreviation normalization."""
     s = text.lower()
     # Possessive normalization: Cushing's -> cushing, Cushing’s -> cushing
     s = re.sub(r"['’]s\b", "", s)
     # Minimal abbreviation expansion for the current positive-control contract.
     s = re.sub(r"\bs\.\s*(pneumoniae|pyogenes)\b", r"streptococcus \1", s)
     s = re.sub(r"\bstrep\.?\s*", "streptococcus ", s)
-    tokens = set(re.findall(r"[a-zA-Z0-9]+", s)) - DIAGNOSIS_STOP_WORDS
-    return tokens
+    return [w for w in re.findall(r"[a-zA-Z0-9]+", s) if w not in DIAGNOSIS_STOP_WORDS]
+
+
+def _diagnosis_tokens(text: str) -> Set[str]:
+    """Tokenise a diagnosis, preserving clinical head nouns and expanding common abbreviations."""
+    return set(_diagnosis_token_list(text))
 
 
 def _extract_keywords(
@@ -453,6 +457,13 @@ class AmbossDifferentialReward(BaseReward):
             cand_tokens = _diagnosis_tokens(cand_strip)
             if not cand_tokens:
                 cand_tokens = set(re.findall(r"[a-zA-Z0-9]+", cand_lower))
+
+            # Order-sensitive guard: identical token sets with different order are not equivalent
+            # (e.g. left-to-right vs right-to-left shunt, increased specificity vs decreased specificity).
+            gt_ordered = _diagnosis_token_list(gt_clean)
+            cand_ordered = _diagnosis_token_list(cand_strip)
+            if cand_tokens == gt_tokens and cand_ordered != gt_ordered:
+                return False
 
             # Reject if candidate tokens consist solely of generic clinical head nouns
             if cand_tokens.issubset(GENERIC_CLINICAL_HEAD_NOUNS):

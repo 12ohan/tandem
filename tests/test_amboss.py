@@ -900,3 +900,25 @@ def test_amboss_abbreviation_ambiguity_and_cased_short_tokens():
     # Cased allowlist: pH is preserved, lowercase ph is not a short-token bypass.
     assert "ph" in _extract_keywords("pH", min_len=4)
     assert "ph" not in _extract_keywords("ph", min_len=4)
+
+
+def test_amboss_order_sensitive_false_positives():
+    """Verify that identical token sets in different order are not treated as equivalent."""
+    reward_fn = AmbossDifferentialReward()
+    pairs = [
+        (
+            "Left-to-right shunt through the ventricular septum",
+            "Right-to-left shunt through the ventricular septum",
+        ),
+        (
+            "Increased specificity and decreased negative predictive value",
+            "Decreased specificity and increased negative predictive value",
+        ),
+        (
+            "Stop playing soccer, continue strength training, and do not buy a ski pass",
+            "Continue playing soccer, stop strength training, and do not buy a ski pass",
+        ),
+    ]
+    for gold, cand in pairs:
+        comp = f"<think>reasoning</think><answer>{cand}</answer>"
+        assert reward_fn.compute_reward(prompt="case", completion=comp, ground_truth=gold) == 0.0
