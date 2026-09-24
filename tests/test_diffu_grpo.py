@@ -145,3 +145,55 @@ def test_k3_pointwise_nonnegativity_and_agreement():
     expected_k3 = (p * k3_samples).sum().item()
 
     assert abs(expected_k3 - direct_kl) < 1e-6
+
+
+def test_dual_clipping_negative_advantages():
+    """Verify NeMo RL Dual-Clipping (Ye et al., 2019):
+    When A < 0 and r >> 1 + eps, standard PPO surrogate is -r*A (unbounded positive loss).
+    Dual-clipping caps the effective surrogate at -c*A.
+    """
+    adv = torch.tensor([-1.0])
+    c = 3.0
+    # ratio = exp(2.0) ~ 7.39 >> 1.2
+    pi = torch.tensor([2.0], requires_grad=True)
+    old = torch.tensor([0.0])
+
+    # 1. Without dual clipping: loss = -r * A = -7.389 * (-1.0) = 7.389
+    loss_no_dual, _ = compute_grpo_loss([pi], [old], adv, clip_eps=0.2, beta_kl=0.0, dual_clip_c=None)
+    assert loss_no_dual.item() == pytest.approx(math.exp(2.0))
+
+    # 2. With dual clipping c=3.0: loss is capped at -c * A = -3.0 * (-1.0) = 3.0
+    loss_dual, _ = compute_grpo_loss([pi], [old], adv, clip_eps=0.2, beta_kl=0.0, dual_clip_c=c)
+    assert loss_dual.item() == pytest.approx(3.0)
+
+    # Gradient when dual-clipped is 0
+    loss_dual.backward()
+    assert pi.grad.item() == 0.0
+
+
+def test_overlong_filtering_loss_multiplier():
+    """Verify NeMo RL Overlong Filtering:
+    When a completion is marked as truncated without EOS (multiplier=0.0),
+    its surrogate contributes 0 to the loss and gradient update.
+    """
+    pi_1 = torch.tensor([0.1], requires_grad=True)  # ratio = exp(0.1) ~ 1.105 (unclipped)
+    pi_2 = torch.tensor([0.1], requires_grad=True)
+    old_1 = torch.tensor([0.0])
+    old_2 = torch.tensor([0.0])
+    advs = torch.tensor([1.0, -1.0])
+
+    # Completion 2 is overlong-filtered (multiplier = 0.0)
+    loss, _ = compute_grpo_loss(
+        [pi_1, pi_2],
+        [old_1, old_2],
+        advs,
+        loss_multipliers=[1.0, 0.0],
+        clip_eps=0.2,
+        beta_kl=0.0,
+    )
+    loss.backward()
+
+    # pi_1 receives gradient update; pi_2 gradient is None or 0.0
+    assert pi_1.grad is not None and abs(pi_1.grad.item()) > 0
+    assert pi_2.grad is None or pi_2.grad.item() == 0.0
+

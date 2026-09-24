@@ -63,6 +63,8 @@ def compute_grpo_loss(
     clip_eps: float = 0.2,
     beta_kl: float = 0.04,
     divisor_mode: Literal["token_mean", "group_mean"] = "token_mean",
+    dual_clip_c: Optional[float] = None,
+    loss_multipliers: Optional[List[float]] = None,
 ) -> Tuple[torch.Tensor, GRPOMetrics]:
     r"""Compute Group Relative Policy Optimization (GRPO) loss with PPO clipping and additive reference KL.
     
@@ -73,6 +75,10 @@ def compute_grpo_loss(
         where N = \sum_i |o_i| (total completion tokens under token_mean normalization),
         and D_KL uses Schulman's non-negative k3 estimator:
             k3 = \exp(\log \pi_{ref} - \log \pi_\theta) - (\log \pi_{ref} - \log \pi_\theta) - 1 >= 0
+            
+    NeMo RL Enhancements:
+        - Dual-clipping (Ye et al., 2019): prevents excessive updates when A_i < 0 and r >> 1.
+        - Overlong filtering / loss multipliers: masks out completions reaching max length without EOS.
     
     Args:
         policy_logprobs: List of G tensors, each shape [T_i], representing log \pi_\theta(y_t)
@@ -83,6 +89,8 @@ def compute_grpo_loss(
         beta_kl: KL divergence penalty weight (additive outside clip)
         divisor_mode: "token_mean" (standard GRPO token-level average) or
                       "group_mean" (completion-level average, Dr. GRPO critique ablation)
+        dual_clip_c: Optional dual-clip parameter c (e.g. 3.0) for negative advantages.
+        loss_multipliers: Optional per-completion scalar weights (e.g. 0.0 for overlong-filtered rollouts).
         
     Returns:
         loss: Scalar differentiable loss tensor
@@ -112,6 +120,11 @@ def compute_grpo_loss(
         if T_i == 0:
             continue
 
+        multiplier = loss_multipliers[i] if loss_multipliers is not None else 1.0
+        if multiplier == 0.0:
+            # Overlong-filtered rollout: zero gradient update, omitted from loss
+            continue
+
         # Importance ratio: r_t = \exp(log \pi_\theta - log \pi_old)
         # Clamped in log-space to prevent exp() overflow
         log_ratio = torch.clamp(pi_logp - old_logp.detach(), min=-10.0, max=10.0)
@@ -121,6 +134,14 @@ def compute_grpo_loss(
         surr1 = ratio * adv_i
         surr2 = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * adv_i
         token_surr = -torch.min(surr1, surr2)  # shape [T_i]
+
+        # NeMo RL Dual-clipping (Ye et al., 2019) for negative advantages
+        if dual_clip_c is not None and adv_i < 0:
+            token_surr = torch.min(token_surr, -dual_clip_c * adv_i)
+
+        if multiplier != 1.0:
+            token_surr = token_surr * multiplier
+
         token_surrogate_losses.append(token_surr)
         completion_policy_losses.append(token_surr.mean())
 

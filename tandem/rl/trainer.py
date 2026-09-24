@@ -30,6 +30,8 @@ class GRPOTrainerConfig:
     grad_accum_steps: int = 1
     normalize_by_std: bool = True  # Flag to disable std-normalization (Dr. GRPO critique)
     divisor_mode: Literal["token_mean", "group_mean"] = "token_mean"
+    dual_clip_c: Optional[float] = 3.0  # NeMo RL Dual-clipping parameter (Ye et al., 2019)
+    overlong_filtering: bool = False  # Exclude max_tokens completions without EOS from loss
     format_failure_reward: float = 0.0  # Reward assigned when policy drifts to commit mask_token
     train_head_only: bool = False
     empty_cache_interval: int = 1
@@ -241,6 +243,18 @@ class DiffuGRPOTrainer:
                     ref_pi = ref_log_probs[torch.arange(T, device=device), target_ids]
                     ref_logprobs.append(ref_pi)
 
+        # NeMo RL Overlong Filtering: exclude rollouts reaching max length without EOS from gradient
+        loss_multipliers = None
+        if self.config.overlong_filtering:
+            eos_ids = getattr(self.engine.runner, "eos_token_ids", {2, 131070})
+            loss_multipliers = []
+            for traj in rollout.trajectories:
+                c_toks = traj.completion_tokens
+                if len(c_toks) >= self.config.max_new_tokens and not any(tok in eos_ids for tok in c_toks):
+                    loss_multipliers.append(0.0)
+                else:
+                    loss_multipliers.append(1.0)
+
         loss, metrics = compute_grpo_loss(
             policy_logprobs=policy_logprobs,
             old_logprobs=old_logprobs,
@@ -249,6 +263,8 @@ class DiffuGRPOTrainer:
             clip_eps=self.config.clip_eps,
             beta_kl=self.config.beta_kl,
             divisor_mode=self.config.divisor_mode,
+            dual_clip_c=self.config.dual_clip_c,
+            loss_multipliers=loss_multipliers,
         )
 
         return loss, metrics
