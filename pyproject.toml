@@ -36,7 +36,10 @@ dev = [
 include = ["tandem*"]
 
 [tool.pytest.ini_options]
+pythonpath = ["."]
+# On 16 GB Apple Silicon, loading real 3B weights (>9.4 GB) repeatedly within the same pytest session causes OOM.
+# Integration tests are run individually as standalone gates; fast test suite defaults to CPU mocks.
 markers = [
-    "integration: marks tests requiring model weights or external datasets (deselect with '-m \"not integration\"')",
+    "integration: marks tests requiring real 3B model weights on MPS (run individually; excluded from fast suite on 16 GB RAM)",
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
 ]

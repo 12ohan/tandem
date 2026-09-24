@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from tandem.rl.dataset import PromptDataset, PromptItem
-from tandem.rl.reward import FormatReward, RegexMatchReward
+from tandem.rl.reward import BaseReward, FormatReward, RegexMatchReward
 from tandem.rl.trainer import DiffuGRPOTrainer, GRPOTrainerConfig
 from tandem.rl.trajectory import Trajectory, TrajectoryCollector, TrajectoryStep
 from tandem.engine.spec import GenerationOutput
@@ -386,4 +386,101 @@ def test_trainer_curriculum_hint_injection():
     assert "Clinical Guidance: Recognize Streptococcus pneumoniae" in rollout_guided.prompt_item.prompt
     assert rollout_guided.mean_reward == 1.0
     assert "<think>guided reasoning</think>" in rollout_guided.completions[0]
+
+
+def test_trainer_hint_masks_gold_answer_leak():
+    """Verify that curriculum hints screen out and mask direct occurrences of the gold diagnosis."""
+    model = TinyMockModel()
+    runner = TinyMockRunner(model)
+    engine = TinyMockEngine(runner)
+    reward_fn = FormatReward()
+
+    config = GRPOTrainerConfig(mask_gold_in_hint=True)
+    trainer = DiffuGRPOTrainer(engine=engine, reward_fn=reward_fn, config=config)
+
+    # 1. Test gold_why containing the exact gold diagnosis
+    item = PromptItem(
+        prompt="Patient vignette",
+        ground_truth="Streptococcus pneumoniae",
+        metadata={
+            "gold_why": "Streptococcus pneumoniae is the most common cause of sepsis in patients with sickle cell disease.",
+        },
+    )
+    hint = trainer._extract_prompt_hint(item)
+    assert hint is not None
+    # Gold answer and distinctive keywords must NOT appear unmasked
+    assert "Streptococcus pneumoniae" not in hint
+    assert "pneumoniae" not in hint.lower()
+    assert "[CONDITION]" in hint or "[...]" in hint
+
+    # 2. Test learning_objective containing gold diagnosis
+    item_lo = PromptItem(
+        prompt="Patient vignette",
+        ground_truth="Acute appendicitis",
+        metadata={
+            "learning_objective": "Recognize the clinical presentation of Acute appendicitis in elderly patients.",
+        },
+    )
+    hint_lo = trainer._extract_prompt_hint(item_lo)
+    assert hint_lo is not None
+    assert "Acute appendicitis" not in hint_lo
+    assert "appendicitis" not in hint_lo.lower()
+    assert "[CONDITION]" in hint_lo or "[...]" in hint_lo
+
+
+def test_trainer_dead_group_split_semantics():
+    """Verify dead-group split semantics:
+    1. All-failed group (all 0.80 < 2.0): triggers hint rescue re-roll.
+    2. All-correct group (all 2.0 >= 2.0): bypassed without hint re-roll.
+    """
+    model = TinyMockModel()
+    runner = TinyMockRunner(model)
+
+    class MockFixedReward(BaseReward):
+        def __init__(self, score: float):
+            self.score = score
+
+        def compute_reward(self, prompt, completion, **kwargs):
+            return self.score
+
+    class FixedEngine:
+        def __init__(self, runner):
+            self.runner = runner
+
+        def generate(self, **kwargs):
+            collector = TrajectoryCollector([1, 2, 3])
+            collector.append_step(10, -0.5)
+            return GenerationOutput(
+                text="<think>reasoning</think><answer>output</answer>",
+                token_ids=[10],
+                num_generated_tokens=1,
+                num_forward_passes=1,
+                wall_time=0.01,
+                tok_per_sec=100.0,
+                acceptance_rate=1.0,
+                trajectory=collector.to_trajectory(),
+            )
+
+    engine = FixedEngine(runner)
+    config = GRPOTrainerConfig(group_size=2, curriculum_hint_on_zero=True, max_hint_retries=1)
+
+    item = PromptItem(
+        prompt="Clinical vignette",
+        ground_truth="Pneumonia",
+        metadata={"learning_objective": "Identify lower respiratory infection"},
+    )
+
+    # 1. All-failed group (all score 0.80 < 2.0) -> triggers hint rescue
+    trainer_failed = DiffuGRPOTrainer(engine=engine, reward_fn=MockFixedReward(0.80), config=config)
+    rollout_failed = trainer_failed.rollout_group(item)
+    assert rollout_failed.prompt_item.metadata.get("curriculum_hint_applied") is True
+    assert "Clinical Guidance:" in rollout_failed.prompt_item.prompt
+
+    # 2. All-correct group (all score 2.0 >= 2.0) -> bypassed without re-roll
+    trainer_correct = DiffuGRPOTrainer(engine=engine, reward_fn=MockFixedReward(2.0), config=config)
+    rollout_correct = trainer_correct.rollout_group(item)
+    assert rollout_correct.prompt_item.metadata.get("curriculum_hint_applied") is None
+    assert "Clinical Guidance:" not in rollout_correct.prompt_item.prompt
+
+
 

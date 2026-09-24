@@ -134,6 +134,31 @@ def test_candidate_scorer_synthetic_ranking_and_normalization():
     assert 0.0 <= res.entropy_bits <= math.log2(3)
 
 
+def test_candidate_scorer_contrastive_pmi():
+    """Verify that contrastive PMI scoring computes delta against neutral context and ranks candidates."""
+    engine = MockEngine()
+    scorer = CandidateDifferentialScorer(engine=engine)
+
+    vignette = "Patient presentation with fever.\n<answer>"
+    candidates = ["acute cholecystitis", "pneumonia"]
+    neutral = "The most likely diagnosis is:"
+
+    res = scorer.score_candidates(vignette, candidates, neutral_context=neutral)
+
+    assert isinstance(res, DifferentialScoringResult)
+    for c in res.candidates:
+        assert c.pmi_score is not None
+        assert isinstance(c.pmi_score, float)
+
+    # In MockRunner logits are identical across contexts, so PMI delta is near 0.0
+    for c in res.candidates:
+        assert abs(c.pmi_score) < 1e-4
+
+    # Ranking is preserved and probability sums to 1.0
+    total_prob = sum(c.candidate_probability for c in res.candidates)
+    assert total_prob == pytest.approx(1.0, abs=1e-5)
+
+
 def test_candidate_scorer_umls_trie_resolution():
     """Verify that candidates registered in UMLSEntityTrie resolve CUIs and concepts."""
     engine = MockEngine()
@@ -227,9 +252,11 @@ def test_candidate_scorer_real_weights_amboss():
     engine = TandemEngine()
     scorer = CandidateDifferentialScorer(engine=engine)
 
-    candidates = item.metadata.get("differential_candidates", [])
-    if not candidates:
-        candidates = [item.ground_truth, "Asthma", "Tension pneumothorax", "Myocardial infarction"]
+    candidates = item.metadata.get("all_candidates")
+    assert candidates and len(candidates) >= 2, "Question metadata must provide all_candidates"
+    assert item.ground_truth in candidates, (
+        f"Precondition failed: gold answer '{item.ground_truth}' must be present in candidates"
+    )
 
     res = scorer.score_candidates(
         item.prompt,

@@ -5,7 +5,7 @@ import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Dict, List, Literal, Optional, Sequence, Set, Tuple, Union
 
 from tandem.rl.dataset import PromptItem
 from tandem.rl.reward import BaseReward
@@ -99,6 +99,23 @@ class AmbossQuestion:
         return [d["content"] for d in self.distractors if d.get("content")]
 
     @property
+    def distractor_options(self) -> List[str]:
+        """Explicit alias for differential_candidates (distractors only)."""
+        return self.differential_candidates
+
+    @property
+    def all_candidates(self) -> List[str]:
+        """Complete candidate set including gold diagnosis and all distractor options."""
+        cands = []
+        if self.gold_answer:
+            cands.append(self.gold_answer)
+        for d in self.distractors:
+            name = d.get("content")
+            if name and name not in cands:
+                cands.append(name)
+        return cands
+
+    @property
     def distractor_buts(self) -> Dict[str, str]:
         """Mapping from candidate name to its rule-out rationale."""
         return {
@@ -128,6 +145,7 @@ class AmbossQuestion:
         metadata = {
             "qid": self.qid,
             "differential_candidates": self.differential_candidates,
+            "all_candidates": self.all_candidates,
             "learning_objective": self.learning_objective,
             "gold_why": self.gold_why,
             "distractor_buts": self.distractor_buts,
@@ -192,22 +210,30 @@ def load_amboss_questions(
     directory_path: Union[str, Path],
     max_questions: Optional[int] = None,
     include_options: bool = True,
+    split: Literal["all", "train", "eval"] = "all",
+    eval_split_ratio: float = 0.15,
+    eval_seed: int = 42,
 ) -> List[PromptItem]:
-    """Loads Amboss questions into PromptItem instances.
+    """Loads Amboss questions into PromptItem instances with deterministic train/eval splitting.
 
     Each PromptItem contains:
     - prompt: Clean clinical vignette formatted to elicit a <think> differential and <answer> diagnosis.
     - ground_truth: Gold answer text.
-    - metadata: Contains differential_candidates, learning_objective, gold_why, distractor_buts.
+    - metadata: Contains differential_candidates, all_candidates, learning_objective, gold_why, distractor_buts.
 
     Args:
         directory_path: Directory containing Amboss JSON files.
         max_questions: Optional maximum number of questions to load.
         include_options: Whether to include multiple-choice options in the formatted prompt.
+        split: "all", "train" (85% default), or "eval" (15% held-out default).
+        eval_split_ratio: Fraction of questions allocated to held-out eval (default 0.15 ~ 500 Qs).
+        eval_seed: Seed for deterministic hash-based splitting on question ID.
 
     Returns:
-        List of PromptItem instances ready for DiffuGRPO RL training.
+        List of PromptItem instances ready for DiffuGRPO RL training or held-out evaluation.
     """
+    import hashlib
+
     path = Path(directory_path)
     if not path.is_dir():
         raise FileNotFoundError(f"Amboss questions directory not found: {path}")
@@ -222,6 +248,16 @@ def load_amboss_questions(
             with open(fpath, "r", encoding="utf-8") as f:
                 data = json.load(f)
             q = parse_amboss_json(data, file_stem=fpath.stem)
+
+            # Deterministic hash split on QID
+            if split != "all":
+                hash_val = int(hashlib.sha256(f"{q.qid}_{eval_seed}".encode()).hexdigest()[:8], 16)
+                is_eval = (hash_val % 10000) < int(eval_split_ratio * 10000)
+                if split == "eval" and not is_eval:
+                    continue
+                if split == "train" and is_eval:
+                    continue
+
             items.append(q.to_prompt_item(include_options=include_options))
         except Exception:
             # Skip unparseable files gracefully
@@ -359,11 +395,16 @@ class AmbossDifferentialReward(BaseReward):
 
         # If rationale states absence, check if context used affirmative modifiers directly before keyword
         ctx_lower = context_text.lower()
-        kw_idx = ctx_lower.find(keyword)
-        if kw_idx > 0:
-            prefix = ctx_lower[max(0, kw_idx - 35) : kw_idx]
-            affirm_words = ["prominent", "marked", "severe", "present", "presence of", "shows", "confirmed", "diffuse"]
-            if any(aw in prefix for aw in affirm_words):
+        affirm_patterns = [
+            r"\bprominent\b", r"\bmarked\b", r"\bsevere\b", r"\bpresent\b", r"\bpresence\b",
+            r"\bshows\b", r"\bconfirmed\b", r"\bdiffuse\b", r"\breveals\b", r"\bdemonstrates\b",
+            r"\bnotable\b",
+        ]
+        # Iterate over all occurrences of keyword in context, checking each preceding window
+        kw_indices = [m.start() for m in re.finditer(re.escape(keyword.lower()), ctx_lower)]
+        for kw_idx in kw_indices:
+            prefix = ctx_lower[max(0, kw_idx - 40) : kw_idx]
+            if any(re.search(pat, prefix) for pat in affirm_patterns):
                 return True
         return False
 

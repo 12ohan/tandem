@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import random
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -7,6 +9,7 @@ from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
 import torch
 import torch.nn.functional as F
 
+from tandem.rl.amboss import STOP_WORDS
 from tandem.rl.dataset import PromptDataset, PromptItem
 from tandem.rl.diffu_grpo import GRPOMetrics, compute_group_advantages, compute_grpo_loss
 from tandem.rl.reward import BaseReward
@@ -34,9 +37,11 @@ class GRPOTrainerConfig:
     overlong_filtering: bool = False  # Exclude max_tokens completions without EOS from loss
     format_failure_reward: float = 0.0  # Reward assigned when policy drifts to commit mask_token
     train_head_only: bool = False
-    curriculum_hint_on_zero: bool = False  # If True, re-rolls all-zero groups with progressive hint in prompt
+    curriculum_hint_on_zero: bool = False  # If True, re-rolls zero-variance groups with progressive hint in prompt
     hint_fraction: float = 0.25  # Fraction of gold rationale to inject as progressive prompt hint
     max_hint_retries: int = 1  # Maximum curriculum retry attempts per prompt
+    mask_gold_in_hint: bool = True  # Strictly screens and masks gold answer tokens from injected hints
+    hint_anneal_steps: Optional[int] = None  # Steps over which hint probability linearly decays to 0.0
     empty_cache_interval: int = 1
     log_interval: int = 1
     save_dir: Optional[str] = None
@@ -92,6 +97,7 @@ class DiffuGRPOTrainer:
                 trainable_params = list(model.parameters())
 
         self.trainable_params = trainable_params
+        self.global_step = 0
 
         if optimizer is not None:
             self.optimizer = optimizer
@@ -103,36 +109,97 @@ class DiffuGRPOTrainer:
             )
 
     def _extract_prompt_hint(self, prompt_item: PromptItem) -> Optional[str]:
-        """Extract a clinical curriculum hint from prompt metadata if available."""
+        """Extract a clinical curriculum hint from prompt metadata if available,
+        strictly screening and masking any direct mentions, abbreviations, or distinctive
+        subwords of the gold diagnosis. Drops answer-bearing sentences and falls back safely.
+        """
         meta = prompt_item.metadata
         if not meta:
             return None
 
-        # 1. Direct explicit hint
-        if "hint" in meta and meta["hint"]:
-            return str(meta["hint"]).strip()
+        gold = str(prompt_item.ground_truth or "").strip()
+        gold_clean = re.sub(r"[^\w\s]", " ", gold).lower().strip()
+        gold_words = [w for w in gold_clean.split() if len(w) >= 3 and w not in STOP_WORDS]
 
-        # 2. Learning objective
+        # Generate abbreviations (e.g. "S. pneumoniae" for "Streptococcus pneumoniae")
+        abbrevs = []
+        parts = gold.split()
+        if len(parts) >= 2:
+            abbrevs.append(f"{parts[0][0]}. {parts[1]}")
+            abbrevs.append(f"{parts[0][0]} {parts[1]}")
+
+        def _screen_text(text: str) -> Optional[str]:
+            """Screen and sentence-filter text to drop answer-bearing clauses.
+            Returns None if all informative content is dropped.
+            """
+            if not text:
+                return None
+            if not self.config.mask_gold_in_hint or not gold:
+                return text.strip()
+
+            # 1. Multi-sentence filtering: if multiple sentences present, prefer dropping answer sentences
+            raw_sentences = re.split(r"(?<=[.!?])\s+", text.strip())
+            if len(raw_sentences) > 1:
+                surviving = []
+                for sent in raw_sentences:
+                    s_lower = sent.lower()
+                    if gold.lower() in s_lower or any(ab.lower() in s_lower for ab in abbrevs) or any(re.search(rf"\b{re.escape(gw)}\b", s_lower) for gw in gold_words):
+                        continue
+                    surviving.append(sent)
+                text_to_mask = " ".join(surviving) if surviving else text.strip()
+            else:
+                text_to_mask = text.strip()
+
+            # 2. Token-level masking across all gold diagnosis mentions and distinctive tokens
+            screened = text_to_mask
+            screened = re.sub(re.escape(gold), "[CONDITION]", screened, flags=re.IGNORECASE)
+            for ab in abbrevs:
+                screened = re.sub(re.escape(ab), "[CONDITION]", screened, flags=re.IGNORECASE)
+            for gw in gold_words:
+                screened = re.sub(rf"\b{re.escape(gw)}\b", "[...]", screened, flags=re.IGNORECASE)
+
+            # Ensure surviving text contains real clinical reasoning tokens
+            cleaned_remaining = re.sub(r"\[\.\.\.\]|\[CONDITION\]|[^\w\s]", " ", screened).strip()
+            meaningful_words = [w for w in cleaned_remaining.split() if len(w) >= 3 and w not in STOP_WORDS]
+            if len(meaningful_words) < 2:
+                return None
+
+            return screened
+
+        # Source 1: Learning objective (preferred high-level conceptual pointer)
         if "learning_objective" in meta and meta["learning_objective"]:
-            return str(meta["learning_objective"]).strip()
+            screened_lo = _screen_text(str(meta["learning_objective"]))
+            if screened_lo:
+                return screened_lo
 
-        # 3. Gold rationale fraction
+        # Source 2: Direct explicit hint (screened)
+        if "hint" in meta and meta["hint"]:
+            screened_hint = _screen_text(str(meta["hint"]))
+            if screened_hint:
+                return screened_hint
+
+        # Source 3: Gold rationale fraction (strictly screened)
         gold_why = meta.get("gold_why")
         if gold_why and isinstance(gold_why, str) and len(gold_why.strip()) > 0:
-            words = gold_why.strip().split()
-            k = max(1, int(len(words) * self.config.hint_fraction))
-            return " ".join(words[:k]) + "..."
+            screened_why = _screen_text(gold_why)
+            if screened_why:
+                words = screened_why.split()
+                k = max(1, int(len(words) * self.config.hint_fraction))
+                return " ".join(words[:k]) + "..."
 
-        # 4. Leading distractor rule-out note
+        # Source 4: Leading distractor rule-out note (screened)
         distractor_buts = meta.get("distractor_buts")
         if distractor_buts and isinstance(distractor_buts, dict) and len(distractor_buts) > 0:
             first_distractor, rationale = next(iter(distractor_buts.items()))
-            return f"Note: {first_distractor} is ruled out because {rationale}"
+            raw_note = f"Note: {first_distractor} is ruled out because {rationale}"
+            screened_note = _screen_text(raw_note)
+            if screened_note:
+                return screened_note
 
         return None
 
     def rollout_group(
-        self, prompt_item: PromptItem, retry_count: int = 0
+        self, prompt_item: PromptItem, retry_count: int = 0, global_step: int = 0
     ) -> GRPORollout:
         """Generate G speculative completions for a prompt and compute normalized advantages."""
         G = self.config.group_size
@@ -195,14 +262,34 @@ class DiffuGRPOTrainer:
                     else:
                         raise e
 
-        # Hint-in-Prompt Curriculum for Homogeneous Zero-Reward Groups:
-        # If all rollouts scored 0.0 and curriculum guidance is enabled, condition the prompt
-        # with clinical metadata guidance and re-roll. This avoids zero-gradient stalls while
-        # preserving exact on-policy importance sampling.
+        # Annealing check for progressive curriculum
+        should_hint = True
+        if self.config.hint_anneal_steps is not None and self.config.hint_anneal_steps > 0:
+            prob = max(0.0, 1.0 - global_step / self.config.hint_anneal_steps)
+            if random.random() > prob:
+                should_hint = False
+
+        # §3 Split dead-group semantics:
+        # Check if all rollouts were truncated without reaching EOS
+        eos_ids = getattr(self.engine.runner, "eos_token_ids", {2, 131070})
+        all_truncated = all(
+            len(traj.completion_tokens) >= self.config.max_new_tokens
+            and not any(tok in eos_ids for tok in traj.completion_tokens)
+            for traj in trajectories
+        )
+
+        reward_span = max(rewards_list) - min(rewards_list) if rewards_list else 0.0
+        gold_threshold = 2.0  # Gold diagnosis award threshold
+
+        # Rescue condition: all-failed (max_r < 2.0), zero-variance (span < 1e-5), not all-truncated
+        # All-correct groups (min_r >= 2.0) are NOT hinted or re-rolled; they bypass rescue cleanly.
         if (
             self.config.curriculum_hint_on_zero
+            and should_hint
             and retry_count < self.config.max_hint_retries
-            and all(r == 0.0 for r in rewards_list)
+            and reward_span < 1e-5
+            and max(rewards_list) < gold_threshold
+            and not all_truncated
         ):
             hint_text = self._extract_prompt_hint(prompt_item)
             if hint_text:
@@ -214,7 +301,7 @@ class DiffuGRPOTrainer:
                     ground_truth=prompt_item.ground_truth,
                     metadata={**prompt_item.metadata, "curriculum_hint_applied": True},
                 )
-                return self.rollout_group(augmented_item, retry_count=retry_count + 1)
+                return self.rollout_group(augmented_item, retry_count=retry_count + 1, global_step=global_step)
 
         device = self.engine.runner.device
         rewards = torch.tensor(rewards_list, dtype=torch.float32, device=device)
@@ -239,6 +326,14 @@ class DiffuGRPOTrainer:
 
     def compute_rollout_loss(self, rollout: GRPORollout) -> Tuple[torch.Tensor, GRPOMetrics]:
         """Compute differentiable GRPO loss for the completions in a group rollout."""
+        device = self.engine.runner.device
+
+        # DAPO-style dead group bypass: if all advantages are zero (e.g. all-correct or rescued group still dead),
+        # zero gradient update is guaranteed, bypassing expensive forward passes.
+        if torch.all(rollout.advantages == 0.0):
+            zero_loss = torch.tensor(0.0, device=device, requires_grad=True)
+            return zero_loss, GRPOMetrics(0.0, 0.0, 0.0, 0.0, 0.0)
+
         G = len(rollout.trajectories)
         device = self.engine.runner.device
 
@@ -349,7 +444,7 @@ class DiffuGRPOTrainer:
             "clip_fraction": metrics.clip_fraction,
         }
 
-    def step(self, batch: List[PromptItem]) -> Dict[str, float]:
+    def step(self, batch: List[PromptItem], global_step: Optional[int] = None) -> Dict[str, float]:
         """Perform a single RL optimization step on a batch of prompts."""
         if not batch:
             return {}
@@ -364,9 +459,10 @@ class DiffuGRPOTrainer:
         total_alpha = 0.0
         total_clip = 0.0
         B = len(batch)
+        cur_step = global_step if global_step is not None else self.global_step
 
         for prompt_item in batch:
-            rollout = self.rollout_group(prompt_item)
+            rollout = self.rollout_group(prompt_item, global_step=cur_step)
             loss, metrics = self.compute_rollout_loss(rollout)
 
             scaled_loss = loss / B
@@ -383,6 +479,7 @@ class DiffuGRPOTrainer:
             torch.nn.utils.clip_grad_norm_(self.trainable_params, self.config.max_grad_norm)
 
         self.optimizer.step()
+        self.global_step += 1
 
         # Free Apple Silicon unified memory buffers between training steps
         if torch.backends.mps.is_available() and self.config.empty_cache_interval > 0:

@@ -512,3 +512,19 @@ def test_amboss_proximity_attribution():
         distractor_buts=buts,
     )
     assert score_stuffed == 2.0  # Gold awarded (2.0), distractor rule-out rejected due to proximity window breach
+
+
+@pytest.mark.skipif(not AMBOSS_QUESTIONS_DIR.is_dir(), reason="Amboss questions directory not accessible")
+def test_amboss_deterministic_train_eval_split():
+    """Verify that train and eval splits are deterministic, disjoint, and non-empty."""
+    train_items = load_amboss_questions(AMBOSS_QUESTIONS_DIR, max_questions=50, split="train", eval_split_ratio=0.20)
+    eval_items = load_amboss_questions(AMBOSS_QUESTIONS_DIR, max_questions=50, split="eval", eval_split_ratio=0.20)
+
+    train_qids = {item.metadata["qid"] for item in train_items}
+    eval_qids = {item.metadata["qid"] for item in eval_items}
+
+    # Splits must be disjoint
+    assert train_qids.isdisjoint(eval_qids), "Train and eval question sets must be mutually exclusive"
+    assert len(train_items) > 0, "Train split must be non-empty"
+    assert len(eval_items) > 0, "Eval split must be non-empty"
+
