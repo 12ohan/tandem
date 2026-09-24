@@ -58,9 +58,9 @@ def run_amboss_grpo_real_weights():
     # For initial smoke test on untrained base model, set gate_on_gold=False
     # so partial rule-out discussion provides variance for gradient estimation
     reward_fn = AmbossDifferentialReward(
-        gold_reward=1.0,
-        ruleout_credit_per_candidate=0.25,
-        max_ruleout_credit=1.0,
+        gold_reward=2.0,
+        ruleout_credit_per_candidate=0.20,
+        max_ruleout_credit=0.80,
         gate_on_gold=False,
     )
 

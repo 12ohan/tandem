@@ -34,3 +34,9 @@ dev = [
 
 [tool.setuptools.packages.find]
 include = ["tandem*"]
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: marks tests requiring model weights or external datasets (deselect with '-m \"not integration\"')",
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+]
