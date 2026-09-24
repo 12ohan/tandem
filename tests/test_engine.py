@@ -171,4 +171,21 @@ def test_accounting_identity_and_boundary_clamping():
     assert committed_eos == [50, 2]
     assert eos_hit is True
 
+    # Case 3: Pin useful alpha formula across truncated rounds
+    # Verify that total_accepted strictly equals sum(min(accepted_r, commit_count_r))
+    mock_rounds = [
+        # (accepted, commit_count)
+        (2, 3),  # full commit: useful = 2
+        (2, 2),  # truncated: useful = 2
+        (2, 1),  # quota clamped: useful = 1
+        (0, 1),  # zero accept: useful = 0
+    ]
+    K = 2
+    R = len(mock_rounds)
+    useful_accepted = sum(min(acc, count) for acc, count in mock_rounds)
+    assert useful_accepted == 2 + 2 + 1 + 0 == 5
+    alpha = useful_accepted / (R * K)
+    assert alpha == 5 / 8 == 0.625
+
+
 

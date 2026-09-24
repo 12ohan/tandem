@@ -137,3 +137,36 @@ def test_engine_level_distributional_exactness():
     empirical_alpha = total_accepted / total_proposed
     assert abs(empirical_alpha - 0.1062) < 0.01
 
+
+def test_engine_trajectory_includes_prefill_token():
+    """Verify that TrajectoryCollector strictly records the prefill token (token 0)
+    in both completion_tokens and steps/logprobs, ensuring zero head-of-response omission.
+    """
+    from tandem.rl.trajectory import TrajectoryCollector
+
+    # 1. Simulate prefill
+    prompt_ids = [100, 101]
+    collector = TrajectoryCollector(prompt_tokens=prompt_ids)
+    
+    first_token_id = 42
+    first_logprob = -0.5
+    first_entropy = 0.8
+    collector.append_step(token_id=first_token_id, logprob=first_logprob, entropy=first_entropy)
+    generated_ids = [first_token_id]
+
+    # 2. Simulate 2 rounds of decode committing tokens [43, 44]
+    collector.append_step(token_id=43, logprob=-0.2, entropy=0.4)
+    generated_ids.append(43)
+    collector.append_step(token_id=44, logprob=-0.1, entropy=0.2)
+    generated_ids.append(44)
+
+    traj = collector.to_trajectory()
+
+    # Assert exact 1-to-1 match between trajectory completion and generated tokens
+    assert traj.completion_tokens == generated_ids
+    assert traj.completion_tokens[0] == first_token_id
+    assert traj.logprobs[0] == first_logprob
+    assert len(traj.steps) == len(generated_ids)
+    assert len(traj.logprobs) == len(generated_ids)
+
+
