@@ -60,6 +60,18 @@ def test_sampler_residual():
     assert sampled.item() in (2,)  # only index 2 has target > draft (0.4 > 0.2)
 
 
+def test_sampler_residual_excludes_mask_id():
+    # If mask_id (index 2) had highest residual, it must be zeroed out
+    target = torch.tensor([[0.1, 0.1, 0.6, 0.2]], dtype=torch.float32)
+    draft = torch.tensor([[0.1, 0.1, 0.1, 0.1]], dtype=torch.float32)
+    
+    # Residual without mask exclusion would be index 2
+    # With mask_id=2 excluded, index 3 must be sampled
+    sampled = sample_residual(target, draft, mask_id=2)
+    assert sampled.item() == 3
+
+
+
 def test_sampler_residual_canary_distribution():
     """Verify Leviathan canary: q = [0.9, 0.1], p = [0.1, 0.9].
     

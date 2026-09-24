@@ -40,19 +40,40 @@ def sample_gumbel_max(
 def sample_residual(
     target_probs: torch.Tensor,
     draft_probs: torch.Tensor,
+    mask_id: int | None = None,
 ) -> torch.Tensor:
     """Sample from the true residual speculative distribution on draft rejection:
     
         P(y) = max(0, p(y) - q(y)) / sum(max(0, p(y') - q(y')))
         
     Guarantees that the combined proposal + verification process exactly recovers
-    the target distribution p without substitution bias.
+    the target distribution p without substitution bias under Leviathan ratio-test
+    speculative decoding (Scheme b).
+    
+    Args:
+        target_probs: Target distribution p(y), shape [..., vocab_size]
+        draft_probs: Proposal distribution q(y), shape [..., vocab_size]
+        mask_id: Optional token ID to explicitly exclude from sampling support (S-2)
     """
     residual = torch.clamp(target_probs - draft_probs, min=0.0)
+    
+    if mask_id is not None:
+        residual = residual.clone()
+        residual[..., mask_id] = 0.0
+
     norm = torch.sum(residual, dim=-1, keepdim=True)
     
     # In case residual sums to near zero due to numerical precision, fallback to target
     fallback_mask = norm <= 1e-8
-    safe_residual = torch.where(fallback_mask, target_probs, residual / torch.clamp(norm, min=1e-8))
+    
+    fallback_target = target_probs
+    if mask_id is not None:
+        fallback_target = target_probs.clone()
+        fallback_target[..., mask_id] = 0.0
+        fallback_norm = torch.sum(fallback_target, dim=-1, keepdim=True)
+        fallback_target = fallback_target / torch.clamp(fallback_norm, min=1e-8)
+
+    safe_residual = torch.where(fallback_mask, fallback_target, residual / torch.clamp(norm, min=1e-8))
     
     return torch.multinomial(safe_residual, num_samples=1).squeeze(-1)
+
