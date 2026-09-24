@@ -1,4 +1,9 @@
 from tandem.config import EngineConfig
+from tandem.engine.candidate_scorer import (
+    CandidateDifferentialScore,
+    CandidateDifferentialScorer,
+    DifferentialScoringResult,
+)
 from tandem.engine.kv_cache import DynamicKVCache
 from tandem.engine.matcher import MatchResult, match_speculative_tokens
 from tandem.engine.model_runner import TandemModelRunner
@@ -58,4 +63,7 @@ __all__ = [
     "DiffuGRPOTrainer",
     "GRPOTrainerConfig",
     "GRPORollout",
+    "CandidateDifferentialScore",
+    "CandidateDifferentialScorer",
+    "DifferentialScoringResult",
 ]

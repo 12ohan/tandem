@@ -221,6 +221,44 @@ class UMLSEntityTrie:
 
         return None, n
 
+    def extract_concepts(
+        self,
+        text: str,
+        tokenizer: Any,
+    ) -> List[Tuple[str, str, int, int]]:
+        """Extract all recognized UMLS medical concepts from a text string.
+
+        Args:
+            text: Arbitrary text string (e.g. clinical vignette or candidate string).
+            tokenizer: Tokenizer with an .encode(text, add_special_tokens=False) method.
+
+        Returns:
+            List of tuples (cui, concept_name, token_start, token_end).
+        """
+        if not text:
+            return []
+
+        tokens = tokenizer.encode(text, add_special_tokens=False)
+        n = len(tokens)
+        matches: List[Tuple[str, str, int, int]] = []
+
+        for start in range(n):
+            curr = self.root.children.get(tokens[start])
+            if curr is None:
+                continue
+
+            if curr.is_terminal and curr.cui and curr.concept_name:
+                matches.append((curr.cui, curr.concept_name, start, start + 1))
+
+            for j in range(start + 1, n):
+                curr = curr.children.get(tokens[j])
+                if curr is None:
+                    break
+                if curr.is_terminal and curr.cui and curr.concept_name:
+                    matches.append((curr.cui, curr.concept_name, start, j + 1))
+
+        return matches
+
     def propose_draft(
         self,
         prefix_tokens: List[int],
