@@ -34,6 +34,9 @@ class GRPOTrainerConfig:
     overlong_filtering: bool = False  # Exclude max_tokens completions without EOS from loss
     format_failure_reward: float = 0.0  # Reward assigned when policy drifts to commit mask_token
     train_head_only: bool = False
+    curriculum_hint_on_zero: bool = False  # If True, re-rolls all-zero groups with progressive hint in prompt
+    hint_fraction: float = 0.25  # Fraction of gold rationale to inject as progressive prompt hint
+    max_hint_retries: int = 1  # Maximum curriculum retry attempts per prompt
     empty_cache_interval: int = 1
     log_interval: int = 1
     save_dir: Optional[str] = None
@@ -99,7 +102,38 @@ class DiffuGRPOTrainer:
                 weight_decay=self.config.weight_decay,
             )
 
-    def rollout_group(self, prompt_item: PromptItem) -> GRPORollout:
+    def _extract_prompt_hint(self, prompt_item: PromptItem) -> Optional[str]:
+        """Extract a clinical curriculum hint from prompt metadata if available."""
+        meta = prompt_item.metadata
+        if not meta:
+            return None
+
+        # 1. Direct explicit hint
+        if "hint" in meta and meta["hint"]:
+            return str(meta["hint"]).strip()
+
+        # 2. Learning objective
+        if "learning_objective" in meta and meta["learning_objective"]:
+            return str(meta["learning_objective"]).strip()
+
+        # 3. Gold rationale fraction
+        gold_why = meta.get("gold_why")
+        if gold_why and isinstance(gold_why, str) and len(gold_why.strip()) > 0:
+            words = gold_why.strip().split()
+            k = max(1, int(len(words) * self.config.hint_fraction))
+            return " ".join(words[:k]) + "..."
+
+        # 4. Leading distractor rule-out note
+        distractor_buts = meta.get("distractor_buts")
+        if distractor_buts and isinstance(distractor_buts, dict) and len(distractor_buts) > 0:
+            first_distractor, rationale = next(iter(distractor_buts.items()))
+            return f"Note: {first_distractor} is ruled out because {rationale}"
+
+        return None
+
+    def rollout_group(
+        self, prompt_item: PromptItem, retry_count: int = 0
+    ) -> GRPORollout:
         """Generate G speculative completions for a prompt and compute normalized advantages."""
         G = self.config.group_size
         completions: List[str] = []
@@ -160,6 +194,27 @@ class DiffuGRPOTrainer:
                         rewards_list.append(float(self.config.format_failure_reward))
                     else:
                         raise e
+
+        # Hint-in-Prompt Curriculum for Homogeneous Zero-Reward Groups:
+        # If all rollouts scored 0.0 and curriculum guidance is enabled, condition the prompt
+        # with clinical metadata guidance and re-roll. This avoids zero-gradient stalls while
+        # preserving exact on-policy importance sampling.
+        if (
+            self.config.curriculum_hint_on_zero
+            and retry_count < self.config.max_hint_retries
+            and all(r == 0.0 for r in rewards_list)
+        ):
+            hint_text = self._extract_prompt_hint(prompt_item)
+            if hint_text:
+                augmented_prompt = (
+                    f"{prompt_item.prompt.rstrip()}\n\nClinical Guidance: {hint_text}\n"
+                )
+                augmented_item = PromptItem(
+                    prompt=augmented_prompt,
+                    ground_truth=prompt_item.ground_truth,
+                    metadata={**prompt_item.metadata, "curriculum_hint_applied": True},
+                )
+                return self.rollout_group(augmented_item, retry_count=retry_count + 1)
 
         device = self.engine.runner.device
         rewards = torch.tensor(rewards_list, dtype=torch.float32, device=device)

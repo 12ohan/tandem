@@ -326,3 +326,64 @@ def test_trainer_zero_grad_on_ref_model():
     # Ref model parameters must NEVER receive gradients
     for p in ref_model.parameters():
         assert p.grad is None
+
+
+def test_trainer_curriculum_hint_injection():
+    """Verify that when curriculum_hint_on_zero=True and all rollouts score 0,
+    the trainer re-rolls with clinical guidance injected into the prompt.
+    """
+    model = TinyMockModel()
+    runner = TinyMockRunner(model)
+
+    class HintResponsiveEngine(TinyMockEngine):
+        def generate(self, prompt, **kwargs):
+            # If prompt has guidance, output <think> text which scores on FormatReward
+            if "Clinical Guidance" in prompt:
+                text = "<think>guided reasoning</think><answer>correct</answer>"
+                comp_tokens = [20, 21, 22, 23]
+            else:
+                text = "completely wrong format"
+                comp_tokens = [50, 51]
+
+            collector = TrajectoryCollector([1, 2, 3], temperature=kwargs.get("temperature", 1.0))
+            for tok in comp_tokens:
+                collector.append_step(token_id=tok, logprob=-1.0)
+
+            return GenerationOutput(
+                text=text,
+                token_ids=comp_tokens,
+                num_generated_tokens=len(comp_tokens),
+                num_forward_passes=1,
+                wall_time=0.01,
+                tok_per_sec=100.0,
+                acceptance_rate=1.0,
+                trajectory=collector.to_trajectory(),
+            )
+
+    engine = HintResponsiveEngine(runner)
+    reward_fn = FormatReward()  # scores 1.0 if <think> and <answer> present, else 0.0
+
+    # 1. Without curriculum guidance: all score 0.0, advantages 0.0
+    config_noguide = GRPOTrainerConfig(group_size=2, curriculum_hint_on_zero=False)
+    trainer_noguide = DiffuGRPOTrainer(engine=engine, reward_fn=reward_fn, config=config_noguide)
+    item_raw = PromptItem(
+        prompt="Hard clinical vignette",
+        metadata={"learning_objective": "Recognize Streptococcus pneumoniae"},
+    )
+    rollout_noguide = trainer_noguide.rollout_group(item_raw)
+    assert rollout_noguide.mean_reward == 0.0
+    assert torch.equal(rollout_noguide.advantages, torch.zeros(2))
+    assert "curriculum_hint_applied" not in rollout_noguide.prompt_item.metadata
+
+    # 2. With curriculum guidance: triggers retry with prompt guidance, scores 1.0
+    config_guide = GRPOTrainerConfig(
+        group_size=2, curriculum_hint_on_zero=True, max_hint_retries=1
+    )
+    trainer_guide = DiffuGRPOTrainer(engine=engine, reward_fn=reward_fn, config=config_guide)
+    rollout_guided = trainer_guide.rollout_group(item_raw)
+
+    assert rollout_guided.prompt_item.metadata.get("curriculum_hint_applied") is True
+    assert "Clinical Guidance: Recognize Streptococcus pneumoniae" in rollout_guided.prompt_item.prompt
+    assert rollout_guided.mean_reward == 1.0
+    assert "<think>guided reasoning</think>" in rollout_guided.completions[0]
+
