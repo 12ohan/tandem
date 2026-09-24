@@ -169,7 +169,6 @@ class TandemEngine:
             # Cast bool to int32 before cumprod to prevent MPS runtime error
             cum_matches = matches.to(torch.int32).cumprod(dim=0)
             accepted = int(cum_matches.sum().item())
-            total_accepted_drafts += accepted
 
             # Candidate tokens: accepted drafts + causal boundary token
             candidate_tokens = ar_tokens[0, : accepted + 1].tolist()
@@ -191,7 +190,12 @@ class TandemEngine:
                 if eos_hit and candidate_tokens[commit_count - 1] not in eos_ids:
                     eos_hit = False
 
+            # Accumulate only accepted drafts that were actually committed
+            useful_accepted = min(accepted, commit_count)
+            total_accepted_drafts += useful_accepted
+
             committed_tokens = candidate_tokens[:commit_count]
+
 
             # Advance KV cache by committed tokens and crop out unverified / post-EOS tail
             crop_cache(past_key_values, cache_len + commit_count)

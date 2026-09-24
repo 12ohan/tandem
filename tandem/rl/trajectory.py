@@ -16,9 +16,21 @@ class TrajectoryStep:
 
 @dataclass
 class Trajectory:
+    r"""RL rollout trajectory container.
+    
+    Logprob Convention:
+        All log probabilities in Trajectory are recorded under the sampling policy:
+            log \pi_\theta(y | x) = log Softmax(logits / max(temperature, 1e-5))[y]
+        For greedy rollouts (temperature <= 0.0), logprobs are recorded at temperature 1.0:
+            log \pi_\theta(y | x) = log Softmax(logits)[y]
+        Downstream GRPO trainers consuming these trajectories should use this exact policy
+        distribution for importance sampling ratios: \pi_\theta / \pi_{ref}.
+    """
+
     prompt_tokens: List[int]
     steps: List[TrajectoryStep] = field(default_factory=list)
     completion_tokens: List[int] = field(default_factory=list)
+
     
     @property
     def total_tokens(self) -> int:

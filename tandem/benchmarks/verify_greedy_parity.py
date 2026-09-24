@@ -95,9 +95,11 @@ def verify_greedy_parity():
     assert len(k2_logprobs) == len(ar_logprobs), f"Trajectory length mismatch: {len(k2_logprobs)} vs {len(ar_logprobs)}"
 
     deltas_k2 = [abs(a - b) for a, b in zip(ar_logprobs, k2_logprobs)]
-    max_delta_k2 = max(deltas_k2)
+    max_idx_k2 = int(torch.tensor(deltas_k2).argmax().item())
+    max_delta_k2 = deltas_k2[max_idx_k2]
     mean_delta_k2 = sum(deltas_k2) / len(deltas_k2)
-    print(f"PASS: Tandem K=2 logprob alignment (max |delta| = {max_delta_k2:.2e}, mean |delta| = {mean_delta_k2:.2e}).")
+    print(f"PASS: Tandem K=2 logprob alignment (max |delta| = {max_delta_k2:.2e} at token {max_idx_k2}, mean |delta| = {mean_delta_k2:.2e}).")
+    print(f"      K=2 sample deltas: {[round(d, 4) for d in deltas_k2[:5]]}")
     assert max_delta_k2 < 0.15, f"Logprob mismatch exceeding fp16 reduction bounds: max |delta| = {max_delta_k2}"
 
     assert out_k4.trajectory is not None, "K=4 trajectory is missing!"
@@ -105,10 +107,13 @@ def verify_greedy_parity():
     assert len(k4_logprobs) == len(ar_logprobs), f"Trajectory length mismatch: {len(k4_logprobs)} vs {len(ar_logprobs)}"
 
     deltas_k4 = [abs(a - b) for a, b in zip(ar_logprobs, k4_logprobs)]
-    max_delta_k4 = max(deltas_k4)
+    max_idx_k4 = int(torch.tensor(deltas_k4).argmax().item())
+    max_delta_k4 = deltas_k4[max_idx_k4]
     mean_delta_k4 = sum(deltas_k4) / len(deltas_k4)
-    print(f"PASS: Tandem K=4 logprob alignment (max |delta| = {max_delta_k4:.2e}, mean |delta| = {mean_delta_k4:.2e}).")
+    print(f"PASS: Tandem K=4 logprob alignment (max |delta| = {max_delta_k4:.2e} at token {max_idx_k4}, mean |delta| = {mean_delta_k4:.2e}).")
+    print(f"      K=4 sample deltas: {[round(d, 4) for d in deltas_k4[:5]]}")
     assert max_delta_k4 < 0.15, f"Logprob mismatch exceeding fp16 reduction bounds: max |delta| = {max_delta_k4}"
+
 
 
 
