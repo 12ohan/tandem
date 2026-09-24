@@ -203,6 +203,12 @@ def parse_args(args: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--clip-eps", type=float, default=0.2, help="PPO surrogate clipping epsilon")
     parser.add_argument("--dual-clip-c", type=float, default=3.0, help="NeMo dual-clipping threshold")
     parser.add_argument(
+        "--normalize-by-std",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Divide group advantages by std (disable for Dr. GRPO mean-centered advantage)",
+    )
+    parser.add_argument(
         "--curriculum",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -293,6 +299,7 @@ def train(args: argparse.Namespace) -> None:
         block_size=args.block_size,
         clip_eps=args.clip_eps,
         dual_clip_c=args.dual_clip_c,
+        normalize_by_std=args.normalize_by_std,
         beta_kl=getattr(args, "kl_beta", 0.04),
         train_head_only=True,  # 402M untied diffusion head
         curriculum_hint_on_zero=args.curriculum,

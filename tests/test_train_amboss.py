@@ -146,6 +146,7 @@ def test_train_amboss_parse_args_defaults():
     assert args.curriculum is True
     assert args.format_primed is False
     assert args.skip_preflight is False
+    assert args.normalize_by_std is True
 
 
 def test_train_amboss_parse_args_custom():
@@ -159,6 +160,7 @@ def test_train_amboss_parse_args_custom():
         "--no-curriculum",
         "--format-primed",
         "--skip-preflight",
+        "--no-normalize-by-std",
         "--save-dir", "checkpoints/test_run",
     ]
     args = parse_args(custom_argv)
@@ -170,6 +172,7 @@ def test_train_amboss_parse_args_custom():
     assert args.curriculum is False
     assert args.format_primed is True
     assert args.skip_preflight is True
+    assert args.normalize_by_std is False
     assert args.save_dir == "checkpoints/test_run"
 
 
