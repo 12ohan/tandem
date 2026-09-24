@@ -171,16 +171,34 @@ class TandemEngine:
             accepted = int(cum_matches.sum().item())
             total_accepted_drafts += accepted
 
-            # AR also provides one bonus token at index 'accepted'
-            accepted_tokens_slice = ar_tokens[0, : accepted + 1].tolist()
-            committed_this_round = accepted + 1
+            # Candidate tokens: accepted drafts + causal boundary token
+            candidate_tokens = ar_tokens[0, : accepted + 1].tolist()
 
-            # Advance KV cache by committed tokens and crop out the unverified tail
-            crop_cache(past_key_values, cache_len + committed_this_round)
+            # 1. Early EOS check within candidate slice (lockstep truncation)
+            eos_hit = False
+            commit_count = len(candidate_tokens)
+            for idx, tok in enumerate(candidate_tokens):
+                if tok in eos_ids:
+                    commit_count = idx + 1
+                    eos_hit = True
+                    break
 
-            # Record trajectory if requested
+            # 2. Strict max_new_tokens boundary clamp
+            remaining_quota = max_new_tokens - len(generated_ids)
+            if commit_count > remaining_quota:
+                commit_count = remaining_quota
+                # If truncated before EOS token was reached, do not mark EOS hit
+                if eos_hit and candidate_tokens[commit_count - 1] not in eos_ids:
+                    eos_hit = False
+
+            committed_tokens = candidate_tokens[:commit_count]
+
+            # Advance KV cache by committed tokens and crop out unverified / post-EOS tail
+            crop_cache(past_key_values, cache_len + commit_count)
+
+            # Record trajectory strictly for committed tokens
             if collector and verify_probs is not None:
-                for idx, tok in enumerate(accepted_tokens_slice):
+                for idx, tok in enumerate(committed_tokens):
                     tok_prob = float(verify_probs[0, idx, tok].item())
                     logprob = float(torch.log(torch.tensor(tok_prob) + 1e-12).item())
                     step_entropy = float(
@@ -188,25 +206,24 @@ class TandemEngine:
                     )
                     collector.append_step(token_id=tok, logprob=logprob, entropy=step_entropy)
 
-            generated_ids.extend(accepted_tokens_slice)
+            generated_ids.extend(committed_tokens)
 
-            # Invariant assertion: KV cache length must strictly equal
+            # Strict invariant check: KV cache length must strictly equal
             # prefix prompt tokens + all committed tokens minus the deferred next seed token
-            assert past_key_values.get_seq_length() == prompt_len + len(generated_ids) - 1
+            expected_cache_len = prompt_len + len(generated_ids) - 1
+            actual_cache_len = past_key_values.get_seq_length()
+            if actual_cache_len != expected_cache_len:
+                raise RuntimeError(
+                    f"KV cache composition invariant violated: actual cache_len={actual_cache_len}, "
+                    f"expected={expected_cache_len} (prompt_len={prompt_len}, committed={len(generated_ids)})"
+                )
 
-            # Check if any committed token hit an EOS token
-
-            eos_hit = False
-            for tok in accepted_tokens_slice:
-                if tok in eos_ids:
-                    eos_hit = True
-                    break
-
-            if eos_hit:
+            if eos_hit or len(generated_ids) >= max_new_tokens:
                 break
 
             # The next seed token is the last committed token
-            next_token = ar_tokens[0, accepted : accepted + 1]
+            next_token = torch.tensor([[committed_tokens[-1]]], dtype=torch.long, device=device)
+
 
         # 4. Truncate at EOS if present
         if collector:

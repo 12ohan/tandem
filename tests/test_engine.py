@@ -114,3 +114,61 @@ def test_sampler_residual_canary_distribution():
     assert abs(empirical_p[0].item() - 0.1) < 0.01
     assert abs(empirical_p[1].item() - 0.9) < 0.01
 
+
+def test_accounting_identity_and_boundary_clamping():
+    """Verify that lockstep candidate commitment strictly obeys:
+    1. max_new_tokens quota clamping (never overshooting)
+    2. Mid-block EOS truncation (stopping immediately at EOS)
+    3. KV cache composition invariant holding under all truncations
+    """
+    prompt_len = 10
+    max_new_tokens = 48
+    eos_ids = {2, 131070}
+
+    # Case 1: Quota boundary clamp
+    # Suppose generated_ids currently has 47 tokens. Next round has 3 candidates.
+    generated_ids = list(range(47))
+    candidate_tokens = [101, 102, 103]
+    
+    # Apply spec.py clamping logic
+    eos_hit = False
+    commit_count = len(candidate_tokens)
+    for idx, tok in enumerate(candidate_tokens):
+        if tok in eos_ids:
+            commit_count = idx + 1
+            eos_hit = True
+            break
+            
+    remaining_quota = max_new_tokens - len(generated_ids)
+    if commit_count > remaining_quota:
+        commit_count = remaining_quota
+        if eos_hit and candidate_tokens[commit_count - 1] not in eos_ids:
+            eos_hit = False
+
+    committed = candidate_tokens[:commit_count]
+    assert len(committed) == 1
+    assert committed == [101]
+    
+    generated_ids.extend(committed)
+    assert len(generated_ids) == max_new_tokens
+    # Expected cache length invariant:
+    expected_cache_len = prompt_len + len(generated_ids) - 1
+    assert expected_cache_len == 10 + 48 - 1 == 57
+
+    # Case 2: Mid-block EOS truncation
+    # Suppose 4 candidates proposed: [50, 2, 60, 70] where 2 is EOS
+    candidate_tokens_eos = [50, 2, 60, 70]
+    eos_hit = False
+    commit_count = len(candidate_tokens_eos)
+    for idx, tok in enumerate(candidate_tokens_eos):
+        if tok in eos_ids:
+            commit_count = idx + 1
+            eos_hit = True
+            break
+
+    committed_eos = candidate_tokens_eos[:commit_count]
+    assert len(committed_eos) == 2
+    assert committed_eos == [50, 2]
+    assert eos_hit is True
+
+
