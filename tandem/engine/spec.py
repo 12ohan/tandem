@@ -103,11 +103,17 @@ class TandemEngine:
             first_logprob = float(torch.log(probs[0, next_token.item()] + 1e-12).item())
 
         first_token_id = int(next_token.item())
+        if first_token_id == self.runner.mask_token_id:
+            raise RuntimeError(
+                f"Causal prefill policy committed mask token {self.runner.mask_token_id}"
+            )
+
         if collector:
             entropy = float(-(probs * torch.log(probs + 1e-12)).sum(dim=-1).item())
             collector.append_step(token_id=first_token_id, logprob=first_logprob, entropy=entropy)
 
         generated_ids: List[int] = [first_token_id]
+
 
         if first_token_id in eos_ids:
             wall_time = time.perf_counter() - t0
@@ -195,9 +201,14 @@ class TandemEngine:
             total_accepted_drafts += useful_accepted
 
             committed_tokens = candidate_tokens[:commit_count]
-
+            for tok in committed_tokens:
+                if tok == self.runner.mask_token_id:
+                    raise RuntimeError(
+                        f"Causal verification policy committed mask token {self.runner.mask_token_id}"
+                    )
 
             # Advance KV cache by committed tokens and crop out unverified / post-EOS tail
+
             crop_cache(past_key_values, cache_len + commit_count)
 
             # Record trajectory strictly for committed tokens

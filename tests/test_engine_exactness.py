@@ -68,7 +68,15 @@ def test_engine_level_distributional_exactness():
     prefill_probs = F.softmax(prefill_logits[:, -1, :] / temperature, dim=-1)
     first_token = torch.multinomial(prefill_probs, num_samples=1)
     
-    generated_ids: List[int] = [int(first_token.item())]
+    # Initialize collector and record prefill token
+    from tandem.rl.trajectory import TrajectoryCollector
+    collector = TrajectoryCollector(prompt_tokens=prompt_ids[0].tolist())
+    first_tok_id = int(first_token.item())
+    first_logprob = float(torch.log(prefill_probs[0, first_tok_id] + 1e-12).item())
+    first_entropy = float(-(prefill_probs * torch.log(prefill_probs + 1e-12)).sum().item())
+    collector.append_step(token_id=first_tok_id, logprob=first_logprob, entropy=first_entropy)
+
+    generated_ids: List[int] = [first_tok_id]
     next_token = first_token
 
     # 2. Speculative Decode Loop
@@ -119,8 +127,20 @@ def test_engine_level_distributional_exactness():
         # Assert KV composition invariant after rewind:
         assert cache.seq_len == cache_len_before + committed_this_round
 
+        # Record trajectory steps for committed tokens
+        for idx, tok in enumerate(accepted_tokens_slice):
+            tok_prob = float(verify_probs[0, idx, tok].item())
+            logprob = float(torch.log(torch.tensor(tok_prob) + 1e-12).item())
+            collector.append_step(token_id=tok, logprob=logprob)
+
         generated_ids.extend(accepted_tokens_slice)
         next_token = ar_tokens[0, accepted : accepted + 1]
+
+    # Verify trajectory lockstep with generated_ids
+    traj = collector.to_trajectory()
+    assert traj.completion_tokens == generated_ids
+    assert traj.completion_tokens[0] == first_tok_id
+    assert len(traj.steps) == len(generated_ids)
 
     # Verify committed distribution
     counts = torch.bincount(torch.tensor(generated_ids), minlength=2).float()
@@ -136,6 +156,7 @@ def test_engine_level_distributional_exactness():
     # Expected alpha = (0.18 + 0.0324) / 2 = 0.1062
     empirical_alpha = total_accepted / total_proposed
     assert abs(empirical_alpha - 0.1062) < 0.01
+
 
 
 def test_engine_trajectory_includes_prefill_token():
